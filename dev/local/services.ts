@@ -53,9 +53,10 @@ type ServiceMeta = {
 
 const serviceMeta: Record<string, ServiceMeta> = {
   // core
-  nextjs: { group: 'core', dependsOn: ['postgres', 'redis'] },
+  nextjs: { group: 'core', dependsOn: ['postgres', 'redis', 'stripe'] },
   postgres: { group: 'core', dependsOn: [] },
   redis: { group: 'core', dependsOn: [] },
+  stripe: { group: 'core', dependsOn: [] },
   // cloud-agent
   'cloud-agent-next': {
     group: 'cloud-agent',
@@ -122,7 +123,6 @@ const serviceMeta: Record<string, ServiceMeta> = {
   },
   // kiloclaw
   'kiloclaw-tunnel': { group: 'kiloclaw', dependsOn: [] },
-  'kiloclaw-stripe': { group: 'kiloclaw', dependsOn: [] },
   kiloclaw: {
     group: 'kiloclaw',
     dependsOn: ['postgres', 'kiloclaw-tunnel'],
@@ -305,7 +305,7 @@ function buildServiceDefs(): ServiceDef[] {
       continue;
     }
 
-    if (name === 'kiloclaw-stripe') {
+    if (name === 'stripe') {
       defs.push({
         name,
         type: 'process',

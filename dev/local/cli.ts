@@ -156,7 +156,7 @@ async function cmdUp(targets: string[], repoRoot: string): Promise<void> {
   const SIDEBAR_WIDTH = 40;
 
   // --- Start capture services first (tunnel, stripe) and wait for output ---
-  const captureServiceSet = new Set(['kiloclaw-tunnel', 'kiloclaw-stripe', 'app-builder-tunnel']);
+  const captureServiceSet = new Set(['kiloclaw-tunnel', 'stripe', 'app-builder-tunnel']);
   const captureServices = serviceNames.filter(n => captureServiceSet.has(n));
   const otherServices = serviceNames.filter(n => !captureServiceSet.has(n));
   const startedServices: string[] = [];
@@ -170,7 +170,7 @@ async function cmdUp(targets: string[], repoRoot: string): Promise<void> {
       oldValues.set('tunnel', readEnvValue(tunnelEnvPath, 'KILOCODE_API_BASE_URL'));
       oldMtimes.set('tunnel', readEnvMtime(tunnelEnvPath));
     }
-    if (captureServices.includes('kiloclaw-stripe')) {
+    if (captureServices.includes('stripe')) {
       const stripeEnvPath = path.join(repoRoot, 'apps/web/.env.development.local');
       oldValues.set('stripe', readEnvValue(stripeEnvPath, 'STRIPE_WEBHOOK_SECRET'));
       oldMtimes.set('stripe', readEnvMtime(stripeEnvPath));
@@ -211,7 +211,7 @@ async function cmdUp(targets: string[], repoRoot: string): Promise<void> {
       );
     }
 
-    if (captureServices.includes('kiloclaw-stripe')) {
+    if (captureServices.includes('stripe')) {
       waits.push(
         waitForEnvValueChange(
           path.join(repoRoot, 'apps/web/.env.development.local'),
@@ -223,7 +223,7 @@ async function cmdUp(targets: string[], repoRoot: string): Promise<void> {
           if (ready) {
             console.log('  Stripe webhook secret captured');
           } else {
-            console.warn('  Stripe secret not captured after 30s - check kiloclaw-stripe window');
+            console.warn('  Stripe secret not captured after 30s - check stripe window');
           }
         })
       );
