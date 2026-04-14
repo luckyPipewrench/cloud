@@ -6,6 +6,7 @@ import type { SessionId, ExecutionId } from '../types/ids.js';
 
 const SESSION_ID = 'sess_test' as SessionId;
 const EXECUTION_ID = 'exc_test' as ExecutionId;
+const itWithWebSocketPair = typeof WebSocketPair === 'undefined' ? it.skip : it;
 
 function createFakeState() {
   return {
@@ -13,6 +14,14 @@ function createFakeState() {
     getWebSockets: vi.fn().mockReturnValue([]),
     getTags: vi.fn().mockReturnValue([]),
   } as unknown as DurableObjectState;
+}
+
+function makeIngestRequest(params: Record<string, string>) {
+  const url = new URL('https://example.com/ingest');
+  for (const [key, value] of Object.entries(params)) {
+    url.searchParams.set(key, value);
+  }
+  return new Request(url, { headers: { Upgrade: 'websocket' } });
 }
 
 function createFakeEventQueries() {
@@ -30,8 +39,6 @@ function createFakeDOContext(): IngestDOContext {
   return {
     updateKiloSessionId: vi.fn().mockResolvedValue(undefined),
     updateUpstreamBranch: vi.fn().mockResolvedValue(undefined),
-    clearActiveExecution: vi.fn().mockResolvedValue(undefined),
-    getActiveExecutionId: vi.fn().mockResolvedValue(null),
     getExecution: vi.fn().mockResolvedValue(null),
     transitionToRunning: vi.fn().mockResolvedValue(true),
     updateHeartbeat: vi.fn().mockResolvedValue(undefined),
@@ -62,9 +69,17 @@ function makeAttachment(overrides?: Partial<IngestAttachment>): IngestAttachment
   };
 }
 
+function makeStreamMessage(streamEventType: string, data?: Record<string, unknown>) {
+  return JSON.stringify({
+    streamEventType,
+    data: data ?? {},
+    timestamp: new Date().toISOString(),
+  });
+}
+
 describe('createIngestHandler', () => {
   describe('handleIngestClose', () => {
-    it('returns null when WebSocket has no attachment', () => {
+    it('returns null when WebSocket has no attachment', async () => {
       const state = createFakeState();
       const handler = createIngestHandler(
         state,
@@ -75,10 +90,10 @@ describe('createIngestHandler', () => {
       );
       const ws = createFakeWebSocket(null);
 
-      expect(handler.handleIngestClose(ws)).toBeNull();
+      await expect(handler.handleIngestClose(ws)).resolves.toBeNull();
     });
 
-    it('returns executionId when no other ingest sockets remain', () => {
+    it('returns executionId when no other ingest sockets remain', async () => {
       const state = createFakeState();
       // No remaining sockets for this execution
       vi.mocked(state.getWebSockets).mockReturnValue([]);
@@ -92,11 +107,15 @@ describe('createIngestHandler', () => {
       );
       const ws = createFakeWebSocket(makeAttachment());
 
-      expect(handler.handleIngestClose(ws)).toBe(EXECUTION_ID);
+      await expect(handler.handleIngestClose(ws)).resolves.toEqual({
+        executionId: EXECUTION_ID,
+        wrapperGeneration: undefined,
+        wrapperConnectionId: undefined,
+      });
       expect(state.getWebSockets).toHaveBeenCalledWith(`ingest:${EXECUTION_ID}`);
     });
 
-    it('returns null when a replacement ingest socket exists', () => {
+    it('returns null when a replacement ingest socket exists', async () => {
       const state = createFakeState();
       const replacementWs = createFakeWebSocket();
       // A replacement socket still exists for this execution
@@ -111,7 +130,7 @@ describe('createIngestHandler', () => {
       );
       const ws = createFakeWebSocket(makeAttachment());
 
-      expect(handler.handleIngestClose(ws)).toBeNull();
+      await expect(handler.handleIngestClose(ws)).resolves.toBeNull();
     });
 
     // The positive case through the full handleIngestRequest → handleIngestClose
@@ -124,14 +143,6 @@ describe('createIngestHandler', () => {
       return JSON.stringify({
         streamEventType: 'kilocode',
         data: { event: eventName, properties },
-        timestamp: new Date().toISOString(),
-      });
-    }
-
-    function makeStreamMessage(streamEventType: string, data?: Record<string, unknown>) {
-      return JSON.stringify({
-        streamEventType,
-        data: data ?? {},
         timestamp: new Date().toISOString(),
       });
     }
@@ -269,6 +280,123 @@ describe('createIngestHandler', () => {
       }
     );
 
+    it('pong updates wrapper liveness before broadcast without marking meaningful output', async () => {
+      const calls: string[] = [];
+      const doContext = createFakeDOContext();
+      doContext.isCurrentWrapperConnection = vi.fn().mockResolvedValue(true);
+      doContext.recordWrapperPong = vi.fn().mockImplementation(async () => {
+        calls.push('pong');
+      });
+      doContext.recordMeaningfulWrapperOutput = vi.fn().mockResolvedValue(undefined);
+      const handler = createIngestHandler(
+        createFakeState(),
+        createFakeEventQueries(),
+        SESSION_ID,
+        () => calls.push('broadcast'),
+        doContext
+      );
+      const ws = createFakeWebSocket(
+        makeAttachment({ wrapperGeneration: 3, wrapperConnectionId: 'conn_current' })
+      );
+
+      await handler.handleIngestMessage(ws, makeStreamMessage('pong'));
+
+      expect(doContext.recordWrapperPong).toHaveBeenCalledWith(
+        3,
+        'conn_current',
+        expect.any(Number)
+      );
+      expect(doContext.recordMeaningfulWrapperOutput).not.toHaveBeenCalled();
+      expect(calls).toEqual(['pong', 'broadcast']);
+    });
+
+    it.each(['pong', 'wrapper_resumed'])(
+      '%s does not clear no-output liveness',
+      async eventType => {
+        const doContext = createFakeDOContext();
+        doContext.isCurrentWrapperConnection = vi.fn().mockResolvedValue(true);
+        doContext.recordWrapperPong = vi.fn().mockResolvedValue(undefined);
+        doContext.recordMeaningfulWrapperOutput = vi.fn().mockResolvedValue(undefined);
+        const handler = createIngestHandler(
+          createFakeState(),
+          createFakeEventQueries(),
+          SESSION_ID,
+          vi.fn(),
+          doContext
+        );
+        const ws = createFakeWebSocket(
+          makeAttachment({ wrapperGeneration: 3, wrapperConnectionId: 'conn_current' })
+        );
+
+        await handler.handleIngestMessage(ws, makeStreamMessage(eventType));
+
+        if (eventType === 'pong') {
+          expect(doContext.recordWrapperPong).toHaveBeenCalled();
+        } else {
+          expect(doContext.recordWrapperPong).not.toHaveBeenCalled();
+        }
+        expect(doContext.recordMeaningfulWrapperOutput).not.toHaveBeenCalled();
+      }
+    );
+
+    it('heartbeat clears no-output liveness before broadcast', async () => {
+      const calls: string[] = [];
+      const doContext = createFakeDOContext();
+      doContext.isCurrentWrapperConnection = vi.fn().mockResolvedValue(true);
+      doContext.recordWrapperPong = vi.fn().mockResolvedValue(undefined);
+      doContext.recordMeaningfulWrapperOutput = vi.fn().mockImplementation(async () => {
+        calls.push('heartbeat');
+      });
+      const handler = createIngestHandler(
+        createFakeState(),
+        createFakeEventQueries(),
+        SESSION_ID,
+        () => calls.push('broadcast'),
+        doContext
+      );
+      const ws = createFakeWebSocket(
+        makeAttachment({ wrapperGeneration: 3, wrapperConnectionId: 'conn_current' })
+      );
+
+      await handler.handleIngestMessage(ws, makeStreamMessage('heartbeat'));
+
+      expect(doContext.recordWrapperPong).not.toHaveBeenCalled();
+      expect(doContext.recordMeaningfulWrapperOutput).toHaveBeenCalledWith(
+        3,
+        'conn_current',
+        expect.any(Number)
+      );
+      expect(calls).toEqual(['heartbeat', 'broadcast']);
+    });
+
+    it('meaningful output clears no-output liveness before broadcast', async () => {
+      const calls: string[] = [];
+      const doContext = createFakeDOContext();
+      doContext.isCurrentWrapperConnection = vi.fn().mockResolvedValue(true);
+      doContext.recordMeaningfulWrapperOutput = vi.fn().mockImplementation(async () => {
+        calls.push('meaningful');
+      });
+      const handler = createIngestHandler(
+        createFakeState(),
+        createFakeEventQueries(),
+        SESSION_ID,
+        () => calls.push('broadcast'),
+        doContext
+      );
+      const ws = createFakeWebSocket(
+        makeAttachment({ wrapperGeneration: 3, wrapperConnectionId: 'conn_current' })
+      );
+
+      await handler.handleIngestMessage(ws, makeStreamMessage('output'));
+
+      expect(doContext.recordMeaningfulWrapperOutput).toHaveBeenCalledWith(
+        3,
+        'conn_current',
+        expect.any(Number)
+      );
+      expect(calls).toEqual(['meaningful', 'broadcast']);
+    });
+
     it('kilo_snapshot is broadcast-only (no special handling)', async () => {
       const eventQueries = createFakeEventQueries();
       const broadcastFn = vi.fn();
@@ -297,6 +425,213 @@ describe('createIngestHandler', () => {
         expect.objectContaining({ id: 0, stream_event_type: 'kilo_snapshot' })
       );
     });
+  });
+
+  describe('wrapper fencing', () => {
+    it('ignores stale fenced socket messages', async () => {
+      const eventQueries = createFakeEventQueries();
+      const broadcastFn = vi.fn();
+      const doContext = createFakeDOContext();
+      doContext.isCurrentWrapperConnection = vi.fn().mockResolvedValue(false);
+      const handler = createIngestHandler(
+        createFakeState(),
+        eventQueries,
+        SESSION_ID,
+        broadcastFn,
+        doContext
+      );
+      const ws = createFakeWebSocket(
+        makeAttachment({ wrapperGeneration: 1, wrapperConnectionId: 'conn_old' })
+      );
+
+      await handler.handleIngestMessage(ws, makeStreamMessage('complete'));
+
+      expect(eventQueries.insert).not.toHaveBeenCalled();
+      expect(broadcastFn).not.toHaveBeenCalled();
+      expect(doContext.updateExecutionStatus).not.toHaveBeenCalled();
+    });
+
+    it('does not report stale fenced socket close as disconnect', async () => {
+      const doContext = createFakeDOContext();
+      doContext.isCurrentWrapperConnection = vi.fn().mockResolvedValue(false);
+      const handler = createIngestHandler(
+        createFakeState(),
+        createFakeEventQueries(),
+        SESSION_ID,
+        vi.fn(),
+        doContext
+      );
+      const ws = createFakeWebSocket(
+        makeAttachment({ wrapperGeneration: 1, wrapperConnectionId: 'conn_old' })
+      );
+
+      await expect(handler.handleIngestClose(ws)).resolves.toBeNull();
+    });
+
+    it('rejects malformed partial fenced connect params', async () => {
+      const doContext = createFakeDOContext();
+      doContext.getExecution = vi.fn().mockResolvedValue({
+        executionId: EXECUTION_ID,
+        ingestToken: EXECUTION_ID,
+        status: 'pending',
+      });
+      const handler = createIngestHandler(
+        createFakeState(),
+        createFakeEventQueries(),
+        SESSION_ID,
+        vi.fn(),
+        doContext
+      );
+
+      await expect(
+        handler.handleIngestRequest(
+          makeIngestRequest({ executionId: EXECUTION_ID, wrapperGeneration: '1' })
+        )
+      ).resolves.toMatchObject({ status: 400 });
+      await expect(
+        handler.handleIngestRequest(
+          makeIngestRequest({ executionId: EXECUTION_ID, wrapperConnectionId: 'conn_current' })
+        )
+      ).resolves.toMatchObject({ status: 400 });
+      await expect(
+        handler.handleIngestRequest(
+          makeIngestRequest({
+            executionId: EXECUTION_ID,
+            wrapperGeneration: 'not-a-number',
+            wrapperConnectionId: 'conn_current',
+          })
+        )
+      ).resolves.toMatchObject({ status: 400 });
+    });
+
+    it('rejects stale fenced connect params before accepting websocket', async () => {
+      const state = createFakeState();
+      const doContext = createFakeDOContext();
+      doContext.getExecution = vi.fn().mockResolvedValue({
+        executionId: EXECUTION_ID,
+        ingestToken: EXECUTION_ID,
+        status: 'pending',
+      });
+      doContext.isCurrentWrapperConnection = vi.fn().mockResolvedValue(false);
+      const handler = createIngestHandler(
+        state,
+        createFakeEventQueries(),
+        SESSION_ID,
+        vi.fn(),
+        doContext
+      );
+
+      const response = await handler.handleIngestRequest(
+        makeIngestRequest({
+          executionId: EXECUTION_ID,
+          wrapperGeneration: '1',
+          wrapperConnectionId: 'conn_old',
+        })
+      );
+
+      expect(response.status).toBe(409);
+      expect(state.acceptWebSocket).not.toHaveBeenCalled();
+    });
+
+    itWithWebSocketPair(
+      'accepts current fenced connection and cancels matching grace',
+      async () => {
+        const state = createFakeState();
+        const doContext = createFakeDOContext();
+        doContext.getExecution = vi.fn().mockResolvedValue({
+          executionId: EXECUTION_ID,
+          ingestToken: EXECUTION_ID,
+          status: 'pending',
+        });
+        doContext.isCurrentWrapperConnection = vi.fn().mockResolvedValue(true);
+        doContext.cancelDisconnectGrace = vi.fn().mockResolvedValue(undefined);
+        const handler = createIngestHandler(
+          state,
+          createFakeEventQueries(),
+          SESSION_ID,
+          vi.fn(),
+          doContext
+        );
+
+        const response = await handler.handleIngestRequest(
+          makeIngestRequest({
+            executionId: EXECUTION_ID,
+            wrapperGeneration: '2',
+            wrapperConnectionId: 'conn_current',
+          })
+        );
+
+        expect(response.status).toBe(101);
+        expect(state.acceptWebSocket).toHaveBeenCalledOnce();
+        expect(doContext.cancelDisconnectGrace).toHaveBeenCalledWith(2, 'conn_current');
+      }
+    );
+
+    itWithWebSocketPair('replaces duplicate same fenced reconnect', async () => {
+      const existingWs = createFakeWebSocket(
+        makeAttachment({ wrapperGeneration: 2, wrapperConnectionId: 'conn_current' })
+      );
+      const state = createFakeState();
+      vi.mocked(state.getWebSockets).mockReturnValue([existingWs]);
+      const doContext = createFakeDOContext();
+      doContext.getExecution = vi.fn().mockResolvedValue({
+        executionId: EXECUTION_ID,
+        ingestToken: EXECUTION_ID,
+        status: 'running',
+      });
+      doContext.isCurrentWrapperConnection = vi.fn().mockResolvedValue(true);
+      const handler = createIngestHandler(
+        state,
+        createFakeEventQueries(),
+        SESSION_ID,
+        vi.fn(),
+        doContext
+      );
+
+      const response = await handler.handleIngestRequest(
+        makeIngestRequest({
+          executionId: EXECUTION_ID,
+          wrapperGeneration: '2',
+          wrapperConnectionId: 'conn_current',
+        })
+      );
+
+      expect(response.status).toBe(101);
+      expect(existingWs.close).toHaveBeenCalledWith(1000, 'Replaced by new connection');
+    });
+
+    itWithWebSocketPair(
+      'does not let legacy reconnect replace fenced socket or cancel fenced grace',
+      async () => {
+        const existingWs = createFakeWebSocket(
+          makeAttachment({ wrapperGeneration: 2, wrapperConnectionId: 'conn_current' })
+        );
+        const state = createFakeState();
+        vi.mocked(state.getWebSockets).mockReturnValue([existingWs]);
+        const doContext = createFakeDOContext();
+        doContext.getExecution = vi.fn().mockResolvedValue({
+          executionId: EXECUTION_ID,
+          ingestToken: EXECUTION_ID,
+          status: 'running',
+        });
+        doContext.cancelDisconnectGrace = vi.fn().mockResolvedValue(undefined);
+        const handler = createIngestHandler(
+          state,
+          createFakeEventQueries(),
+          SESSION_ID,
+          vi.fn(),
+          doContext
+        );
+
+        const response = await handler.handleIngestRequest(
+          makeIngestRequest({ executionId: EXECUTION_ID })
+        );
+
+        expect(response.status).toBe(101);
+        expect(existingWs.close).not.toHaveBeenCalled();
+        expect(doContext.cancelDisconnectGrace).toHaveBeenCalledWith(undefined, undefined);
+      }
+    );
   });
 
   describe('hasActiveConnection', () => {

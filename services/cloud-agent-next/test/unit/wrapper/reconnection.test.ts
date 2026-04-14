@@ -7,9 +7,22 @@
 
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import {
+  allocateWrapperRuntimeState,
+  clearWrapperRuntimeIdentityForExecution,
+  getWrapperRuntimeState,
+  recordWrapperAcceptedMessage,
+  recordWrapperPong,
+} from '../../../src/session/wrapper-runtime-state.js';
+import {
   createConnectionManager,
   type ConnectionCallbacks,
 } from '../../../wrapper/src/connection.js';
+import {
+  bindExecutionContext,
+  type ExecutionBinding,
+  type ServerConfig,
+  type ServerDependencies,
+} from '../../../wrapper/src/server.js';
 import { WrapperState, type JobContext } from '../../../wrapper/src/state.js';
 import type { WrapperKiloClient } from '../../../wrapper/src/kilo-api.js';
 import type { IngestEvent } from '../../../src/shared/protocol.js';
@@ -115,6 +128,8 @@ const createJobContext = (): JobContext => ({
   ingestUrl: 'wss://ingest.example.com/ingest',
   ingestToken: 'token_secret',
   workerAuthToken: 'kilo_token_789',
+  wrapperGeneration: 7,
+  wrapperConnectionId: 'conn_test',
 });
 
 const createCallbacks = (): ConnectionCallbacks & {
@@ -198,6 +213,234 @@ async function openConnection(
 // Tests
 // ---------------------------------------------------------------------------
 
+describe('wrapper runtime state', () => {
+  const createStorage = () => {
+    const storage = new Map<string, unknown>();
+    return {
+      get: async (key: string) => storage.get(key),
+      put: async (key: string, value: unknown) => {
+        storage.set(key, value);
+      },
+    } as unknown as DurableObjectStorage;
+  };
+
+  it('sanitizes liveness state when reusing the same execution allocation', async () => {
+    const durableStorage = createStorage();
+
+    const allocated = await allocateWrapperRuntimeState(durableStorage, 'exec_test', 1_000);
+    await recordWrapperAcceptedMessage(
+      durableStorage,
+      allocated,
+      'msg_018f1e2d3c4bSanitizeXXXXXX',
+      'exec_test',
+      10_000,
+      61_000
+    );
+    if (!allocated.wrapperConnectionId) throw new Error('expected wrapper connection ID');
+    await recordWrapperPong(
+      durableStorage,
+      allocated.wrapperGeneration,
+      allocated.wrapperConnectionId,
+      2_000,
+      62_000
+    );
+
+    const reused = await allocateWrapperRuntimeState(durableStorage, 'exec_test', 3_000);
+    const stored = await getWrapperRuntimeState(durableStorage);
+
+    expect(reused.wrapperGeneration).toBe(allocated.wrapperGeneration);
+    expect(reused.wrapperConnectionId).toBe(allocated.wrapperConnectionId);
+    expect(reused.wrapperExecutionId).toBe('exec_test');
+    expect(stored.acceptedMessageId).toBeUndefined();
+    expect(stored.acceptedExecutionId).toBeUndefined();
+    expect(stored.noOutputDeadlineAt).toBeUndefined();
+    expect(stored.pingDeadlineAt).toBeUndefined();
+    expect(stored.nextPingAt).toBeUndefined();
+  });
+
+  it('does not let stale terminal cleanup clear a newer execution runtime state', async () => {
+    const durableStorage = createStorage();
+
+    const stale = await allocateWrapperRuntimeState(durableStorage, 'exec_stale', 1_000);
+    if (!stale.wrapperConnectionId) throw new Error('expected stale wrapper connection ID');
+
+    const current = await allocateWrapperRuntimeState(durableStorage, 'exec_current', 2_000);
+    if (!current.wrapperConnectionId) throw new Error('expected current wrapper connection ID');
+    await recordWrapperAcceptedMessage(
+      durableStorage,
+      current,
+      'msg_018f1e2d3c4bCurrentXXXXXX',
+      'exec_current',
+      10_000,
+      61_000
+    );
+
+    const cleared = await clearWrapperRuntimeIdentityForExecution(
+      durableStorage,
+      'exec_stale',
+      {
+        wrapperGeneration: stale.wrapperGeneration,
+        wrapperConnectionId: stale.wrapperConnectionId,
+      },
+      { incrementGeneration: true }
+    );
+    const stored = await getWrapperRuntimeState(durableStorage);
+
+    expect(cleared).toBeNull();
+    expect(stored).toEqual({
+      wrapperGeneration: current.wrapperGeneration,
+      wrapperConnectionId: current.wrapperConnectionId,
+      wrapperExecutionId: 'exec_current',
+      lastWrapperConnectedAt: 2_000,
+      acceptedMessageId: 'msg_018f1e2d3c4bCurrentXXXXXX',
+      acceptedExecutionId: 'exec_current',
+      noOutputDeadlineAt: 10_000,
+      nextPingAt: 61_000,
+    });
+  });
+});
+
+describe('wrapper execution binding refresh', () => {
+  const createServerConfig = (): ServerConfig => ({
+    port: 5000,
+    workspacePath: '/workspace',
+    version: 'test',
+    sessionId: 'kilo_sess_456',
+    agentSessionId: 'session_abc',
+    userId: 'user_xyz',
+  });
+
+  const createServerDeps = (state: WrapperState, closeConnection = vi.fn(async () => {})) => {
+    return {
+      state,
+      kiloClient: createMockKiloClient(),
+      openConnection: vi.fn(async () => {}),
+      closeConnection,
+      setAborted: vi.fn(),
+      resetLifecycle: vi.fn(),
+      setPerTurnConfig: vi.fn(),
+    } satisfies ServerDependencies;
+  };
+
+  const createRefreshedBinding = (): ExecutionBinding => ({
+    executionId: 'exec_test',
+    ingestUrl: 'wss://ingest.example.com/ingest-refreshed',
+    ingestToken: 'token_secret_refreshed',
+    workerAuthToken: 'kilo_token_refreshed',
+    wrapperGeneration: 8,
+    wrapperConnectionId: 'conn_refreshed',
+  });
+
+  it('updates same-execution binding fields while idle and closes stale connections', async () => {
+    const state = new WrapperState();
+    state.startJob(createJobContext());
+    const staleWs = new MockWebSocket('wss://ingest.example.com/old');
+    staleWs.simulateOpen();
+    state.setConnections(staleWs as unknown as WebSocket, new AbortController());
+    const closeConnection = vi.fn(async () => {
+      state.clearConnectionRefs();
+      state.setSendToIngestFn(null);
+    });
+    const deps = createServerDeps(state, closeConnection);
+
+    const result = await bindExecutionContext(createRefreshedBinding(), createServerConfig(), deps);
+
+    expect(result).toBeNull();
+    expect(closeConnection).toHaveBeenCalledTimes(1);
+    expect(state.currentJob).toMatchObject({
+      executionId: 'exec_test',
+      kiloSessionId: 'kilo_sess_456',
+      ingestUrl: 'wss://ingest.example.com/ingest-refreshed',
+      ingestToken: 'token_secret_refreshed',
+      workerAuthToken: 'kilo_token_refreshed',
+      wrapperGeneration: 8,
+      wrapperConnectionId: 'conn_refreshed',
+    });
+  });
+
+  it('keeps same-execution unchanged binding idempotent', async () => {
+    const state = new WrapperState();
+    state.startJob(createJobContext());
+    const closeConnection = vi.fn(async () => {});
+    const deps = createServerDeps(state, closeConnection);
+
+    const result = await bindExecutionContext(
+      {
+        executionId: 'exec_test',
+        ingestUrl: 'wss://ingest.example.com/ingest',
+        ingestToken: 'token_secret',
+        workerAuthToken: 'kilo_token_789',
+        wrapperGeneration: 7,
+        wrapperConnectionId: 'conn_test',
+      },
+      createServerConfig(),
+      deps
+    );
+
+    expect(result).toBeNull();
+    expect(closeConnection).not.toHaveBeenCalled();
+    expect(state.currentJob?.wrapperGeneration).toBe(7);
+    expect(state.currentJob?.wrapperConnectionId).toBe('conn_test');
+  });
+
+  it('rejects same-execution binding changes while active', async () => {
+    const state = new WrapperState();
+    state.startJob(createJobContext());
+    state.setActive(true);
+    const closeConnection = vi.fn(async () => {});
+    const deps = createServerDeps(state, closeConnection);
+
+    const result = await bindExecutionContext(createRefreshedBinding(), createServerConfig(), deps);
+
+    expect(result?.status).toBe(409);
+    expect(closeConnection).not.toHaveBeenCalled();
+    expect(state.currentJob?.wrapperGeneration).toBe(7);
+    expect(state.currentJob?.wrapperConnectionId).toBe('conn_test');
+  });
+
+  it('uses refreshed fence values in the next ingest URL and pong source state', async () => {
+    const state = new WrapperState();
+    state.startJob(createJobContext());
+    state.updateJobBinding(createRefreshedBinding());
+    const callbacks = createCallbacks();
+    vi.useFakeTimers();
+    vi.stubGlobal('WebSocket', MockWebSocket);
+    stubFetch();
+
+    try {
+      const manager = createConnectionManager(
+        state,
+        { kiloClient: createMockKiloClient() },
+        callbacks
+      );
+      const ws = await openConnection(manager);
+
+      expect(ws.url).toContain('wrapperGeneration=8');
+      expect(ws.url).toContain('wrapperConnectionId=conn_refreshed');
+      state.sendToIngest({
+        streamEventType: 'pong',
+        data: {
+          executionId: state.currentJob?.executionId,
+          wrapperGeneration: state.currentJob?.wrapperGeneration,
+          wrapperConnectionId: state.currentJob?.wrapperConnectionId,
+        },
+        timestamp: new Date().toISOString(),
+      });
+      const pong = ws.sent
+        .map(message => JSON.parse(message))
+        .find(event => event.streamEventType === 'pong');
+      expect(pong.data).toMatchObject({
+        executionId: 'exec_test',
+        wrapperGeneration: 8,
+        wrapperConnectionId: 'conn_refreshed',
+      });
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
 describe('ingest WS reconnection', () => {
   let state: WrapperState;
   let callbacks: ReturnType<typeof createCallbacks>;
@@ -216,6 +459,16 @@ describe('ingest WS reconnection', () => {
   afterEach(() => {
     vi.useRealTimers();
     vi.unstubAllGlobals();
+  });
+
+  it('opens ingest WebSocket with wrapper fencing query params', async () => {
+    const manager = createManager();
+
+    const ws = await openConnection(manager);
+
+    expect(ws.url).toContain('executionId=exec_test');
+    expect(ws.url).toContain('wrapperGeneration=7');
+    expect(ws.url).toContain('wrapperConnectionId=conn_test');
   });
 
   function createManager() {

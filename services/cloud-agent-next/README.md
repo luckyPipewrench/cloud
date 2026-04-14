@@ -363,8 +363,9 @@ await client.updateSession.mutate({
 
 ### V2 Endpoints
 
-V2 endpoints execute directly and return an immediate ack. Output is delivered via the
-read-only `/stream` WebSocket for live updates and replay.
+V2 endpoints accept requests by storing pending delivery first, then flush messages
+through one wrapper delivery path. Output is delivered via the read-only `/stream`
+WebSocket for live updates and replay.
 
 **Ack shape (all V2 mutations):**
 
@@ -373,13 +374,16 @@ read-only `/stream` WebSocket for live updates and replay.
   cloudAgentSessionId,
   executionId,
   status: 'started',
-  streamUrl: `/stream?cloudAgentSessionId=${cloudAgentSessionId}`
+  streamUrl: `/stream?cloudAgentSessionId=${cloudAgentSessionId}`,
+  messageId,
+  delivery: 'sent' | 'queued'
 }
 ```
 
+`delivery: 'queued'` means the Durable Object accepted and stored the message for delivery. `delivery: 'sent'` is preserved for idempotent replays or lower-level flows where the wrapper has already accepted the message.
+
 **Error responses:**
 
-- `409 Conflict`: Another execution is already in progress (includes `activeExecutionId`)
 - `503 Service Unavailable`: Transient error (sandbox connect, workspace setup, etc.) - client should retry
 
 **Endpoints:**

@@ -179,6 +179,40 @@ export function createSessionManagementHandlers() {
               };
             }
 
+            // Mark session as interrupted in DO before killing processes (with retry)
+            // This signals the streaming generator to stop
+            const doKey = `${userId}:${sessionId}`;
+            const getStub = () =>
+              env.CLOUD_AGENT_SESSION.get(env.CLOUD_AGENT_SESSION.idFromName(doKey));
+
+            await withDORetry(getStub, stub => stub.markAsInterrupted(), 'markAsInterrupted');
+
+            const interruptResult = await withDORetry(
+              getStub,
+              stub => stub.interruptExecution(),
+              'interruptExecution'
+            );
+
+            if (!interruptResult.success) {
+              logger
+                .withFields({
+                  message:
+                    interruptResult.message ??
+                    'No current runtime execution or pending queued messages',
+                })
+                .info('No current runtime execution or pending queued messages to interrupt');
+            }
+
+            const targetExecutionId = interruptResult.executionId;
+            if (!targetExecutionId) {
+              logger.info('Session interruption completed');
+              return {
+                success: true,
+                message: 'Queued session messages interrupted',
+                processesFound: false,
+              };
+            }
+
             const sandboxId: SandboxId =
               metadata.sandboxId ??
               (await generateSandboxId(
@@ -204,33 +238,7 @@ export function createSessionManagementHandlers() {
               botId: metadata.botId,
             });
 
-            // Mark session as interrupted in DO before killing processes (with retry)
-            // This signals the streaming generator to stop
-            const doKey = `${userId}:${sessionId}`;
-            const getStub = () =>
-              env.CLOUD_AGENT_SESSION.get(env.CLOUD_AGENT_SESSION.idFromName(doKey));
-
-            await withDORetry(getStub, stub => stub.markAsInterrupted(), 'markAsInterrupted');
-
-            const interruptResult = await withDORetry(
-              getStub,
-              stub => stub.interruptExecution(),
-              'interruptExecution'
-            );
-
-            if (!interruptResult.success) {
-              logger
-                .withFields({ message: interruptResult.message ?? 'No active execution' })
-                .info('No active execution to interrupt via wrapper');
-            }
-
             await scheduler.wait(INTERRUPT_GRACE_MS);
-
-            const activeExecutionId = await withDORetry(
-              getStub,
-              stub => stub.getActiveExecutionId(),
-              'getActiveExecutionId'
-            );
 
             // Get or create the session to use for killing processes
             const session = await sessionService.getOrCreateSession(
@@ -249,25 +257,25 @@ export function createSessionManagementHandlers() {
               session,
               context,
               usePkill,
-              activeExecutionId ?? undefined
+              targetExecutionId
             );
 
             logger.info('Session interruption completed');
 
-            // If no processes were found but there's still an active execution,
-            // the wrapper is already dead — clear the stale execution immediately.
+            // If no processes were found but there's still a runtime execution,
+            // the wrapper is already dead - fail the stale execution immediately.
             // Note: pkill always returns killedProcessIds: [], so we check
             // processesFound instead to distinguish "killed" from "nothing to kill".
-            if (!result.processesFound && activeExecutionId) {
+            if (!result.processesFound && targetExecutionId) {
               logger
-                .withFields({ executionId: activeExecutionId })
-                .info('No processes found during interrupt - clearing stale active execution');
+                .withFields({ executionId: targetExecutionId })
+                .info('No processes found during interrupt - failing stale runtime execution');
 
               await withDORetry(
                 getStub,
                 stub =>
                   stub.failExecutionRpc({
-                    executionId: activeExecutionId,
+                    executionId: targetExecutionId,
                     error: 'Interrupted - no running processes found',
                   }),
                 'failExecutionRpc'
@@ -326,15 +334,14 @@ export function createSessionManagementHandlers() {
             });
           }
 
-          // Fetch execution state from DO
-          const activeExecutionId = await withDORetry(
+          // Fetch current wrapper runtime execution state from DO
+          const runtimeExecution = await withDORetry(
             getStub,
-            s => s.getActiveExecutionId(),
-            'getActiveExecutionId'
+            s => s.getCurrentRuntimeExecution(),
+            'getCurrentRuntimeExecution'
           );
 
-          // Get active execution metadata if there's an active execution
-          let activeExecutionStatus:
+          let currentRuntimeStatus:
             | 'pending'
             | 'running'
             | 'completed'
@@ -348,21 +355,14 @@ export function createSessionManagementHandlers() {
             error?: string;
           } | null = null;
 
-          if (activeExecutionId) {
-            const executionData = await withDORetry(
-              getStub,
-              s => s.getExecution(activeExecutionId),
-              'getExecution'
-            );
-            if (executionData) {
-              activeExecutionStatus = executionData.status;
-              execution = {
-                startedAt: executionData.startedAt,
-                lastHeartbeat: executionData.lastHeartbeat,
-                processId: executionData.processId,
-                error: executionData.error,
-              };
-            }
+          if (runtimeExecution) {
+            currentRuntimeStatus = runtimeExecution.status;
+            execution = {
+              startedAt: runtimeExecution.startedAt,
+              lastHeartbeat: runtimeExecution.lastHeartbeat,
+              processId: runtimeExecution.processId,
+              error: runtimeExecution.error,
+            };
           }
 
           // Compute sandboxId for log correlation
@@ -379,11 +379,11 @@ export function createSessionManagementHandlers() {
           logger.setTags({ sandboxId, orgId: metadata.orgId ?? '(personal)' });
           logger.info('Session metadata retrieved successfully');
 
-          // Compute execution health if there's an active execution
+          // Compute execution health if there's a current runtime execution
           const executionHealth =
-            execution && activeExecutionStatus
+            execution && currentRuntimeStatus
               ? computeExecutionHealth(
-                  activeExecutionStatus,
+                  currentRuntimeStatus,
                   execution.startedAt,
                   execution.lastHeartbeat
                 )
@@ -422,10 +422,10 @@ export function createSessionManagementHandlers() {
 
             // Execution status (grouped for cleaner API)
             execution:
-              activeExecutionId && activeExecutionStatus && execution
+              runtimeExecution && currentRuntimeStatus && execution
                 ? {
-                    id: activeExecutionId,
-                    status: activeExecutionStatus,
+                    id: runtimeExecution.executionId,
+                    status: currentRuntimeStatus,
                     startedAt: execution.startedAt,
                     lastHeartbeat: execution.lastHeartbeat ?? null,
                     processId: execution.processId ?? null,

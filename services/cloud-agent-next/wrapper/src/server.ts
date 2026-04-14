@@ -12,7 +12,7 @@
  * - POST /job/abort - Abort the current job
  */
 
-import type { WrapperState, JobContext } from './state.js';
+import type { WrapperState, JobContext, ExecutionBindingUpdate } from './state.js';
 import type { WrapperKiloClient } from './kilo-api.js';
 import type { PerTurnConfig } from './lifecycle.js';
 import { createLogUploader } from './log-uploader.js';
@@ -53,12 +53,14 @@ export type ServerDependencies = {
  * A new executionId triggers setup (log uploader, state reset).
  * Same executionId is idempotent. Omitted means use existing context.
  */
-type ExecutionBinding = {
+export type ExecutionBinding = {
   executionId: string;
   ingestUrl: string;
   ingestToken: string;
   workerAuthToken: string;
   upstreamBranch?: string;
+  wrapperGeneration?: number;
+  wrapperConnectionId?: string;
 };
 
 type PromptBody = {
@@ -70,7 +72,7 @@ type PromptBody = {
   model?: { providerID?: string; modelID: string };
   variant?: string;
   agent?: string;
-  messageId?: string;
+  messageId: string;
   system?: string;
   tools?: Record<string, boolean>;
   autoCommit?: boolean;
@@ -115,18 +117,29 @@ function errorResponse(error: string, message: string, status: number): Response
   return jsonResponse({ error, message }, status);
 }
 
+function toBindingUpdate(execution: ExecutionBinding): ExecutionBindingUpdate {
+  return {
+    executionId: execution.executionId,
+    ingestUrl: execution.ingestUrl,
+    ingestToken: execution.ingestToken,
+    workerAuthToken: execution.workerAuthToken,
+    wrapperGeneration: execution.wrapperGeneration,
+    wrapperConnectionId: execution.wrapperConnectionId,
+  };
+}
+
 /**
  * Bind execution context from a prompt/command body.
  *
  * - If `execution` present with a new `executionId`: run setup (store context,
  *   create log uploader, reset lifecycle).
- * - If same `executionId`: no-op (idempotent).
+ * - If same `executionId`: refresh idle binding fields or no-op when unchanged.
  * - If `execution` omitted: use existing job context (for follow-up calls
  *   like answer-question).
  *
  * Returns an error Response if binding fails, or null on success.
  */
-async function bindExecutionContext(
+export async function bindExecutionContext(
   execution: ExecutionBinding | undefined,
   config: ServerConfig,
   deps: ServerDependencies
@@ -141,9 +154,50 @@ async function bindExecutionContext(
     return null;
   }
 
-  // Idempotent: same executionId
+  // Parse ingest URL to derive worker base URL for log uploads and validate refreshes.
+  let workerBaseUrl: string;
+  try {
+    const ingestOrigin = new URL(execution.ingestUrl);
+    ingestOrigin.protocol =
+      ingestOrigin.protocol === 'wss:' || ingestOrigin.protocol === 'https:' ? 'https:' : 'http:';
+    workerBaseUrl = ingestOrigin.origin;
+  } catch {
+    return errorResponse('INVALID_REQUEST', 'Invalid ingestUrl', 400);
+  }
+
+  // Idempotent or refreshed binding: same executionId
   const currentJob = state.currentJob;
   if (currentJob && currentJob.executionId === execution.executionId) {
+    const bindingUpdate = toBindingUpdate(execution);
+    const fenceChanged =
+      currentJob.wrapperGeneration !== execution.wrapperGeneration ||
+      currentJob.wrapperConnectionId !== execution.wrapperConnectionId;
+    const bindingChanged =
+      currentJob.ingestUrl !== execution.ingestUrl ||
+      currentJob.ingestToken !== execution.ingestToken ||
+      currentJob.workerAuthToken !== execution.workerAuthToken ||
+      fenceChanged;
+
+    if (bindingChanged && state.isActive) {
+      logToFile(
+        `execution binding conflict: active same execution changed binding executionId=${execution.executionId}`
+      );
+      return errorResponse(
+        'JOB_CONFLICT',
+        `Cannot refresh execution binding while execution ${execution.executionId} is active`,
+        409
+      );
+    }
+
+    const updateResult = state.updateJobBinding(bindingUpdate);
+    if (updateResult.changed) {
+      logToFile(
+        `execution binding refreshed: executionId=${execution.executionId} generation=${execution.wrapperGeneration ?? 'none'} connectionId=${execution.wrapperConnectionId ?? 'none'}`
+      );
+      if (state.ingestWs || state.sseAbortController) {
+        await deps.closeConnection();
+      }
+    }
     return null;
   }
 
@@ -159,17 +213,6 @@ async function bindExecutionContext(
     );
   }
 
-  // Parse ingest URL to derive worker base URL for log uploads
-  let workerBaseUrl: string;
-  try {
-    const ingestOrigin = new URL(execution.ingestUrl);
-    ingestOrigin.protocol =
-      ingestOrigin.protocol === 'wss:' || ingestOrigin.protocol === 'https:' ? 'https:' : 'http:';
-    workerBaseUrl = ingestOrigin.origin;
-  } catch {
-    return errorResponse('INVALID_REQUEST', 'Invalid ingestUrl', 400);
-  }
-
   // Build job context
   const jobContext: JobContext = {
     executionId: execution.executionId,
@@ -177,6 +220,8 @@ async function bindExecutionContext(
     ingestUrl: execution.ingestUrl,
     ingestToken: execution.ingestToken,
     workerAuthToken: execution.workerAuthToken,
+    wrapperGeneration: execution.wrapperGeneration,
+    wrapperConnectionId: execution.wrapperConnectionId,
   };
 
   // Close stale ingest connection from the prior execution. The prior execution's
@@ -264,7 +309,10 @@ function createPromptHandler(config: ServerConfig, deps: ServerDependencies) {
     if (!body.prompt && !body.parts) {
       return errorResponse('INVALID_REQUEST', 'Either prompt or parts is required', 400);
     }
-    const messageId = body.messageId;
+    if (!body.messageId) {
+      return errorResponse('INVALID_REQUEST', 'messageId is required', 400);
+    }
+    const { messageId } = body;
 
     // Set per-turn config on the lifecycle manager
     deps.setPerTurnConfig({

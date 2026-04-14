@@ -35,7 +35,10 @@ export type StreamEventType =
   | 'kilocode' // Kilocode CLI structured events
   | 'status' // execution status updates
   | 'heartbeat' // keep-alive during idle periods
-  | 'pong'; // response to ping command from DO
+  | 'pong' // response to ping command from DO
+  | 'message.queued' // user message accepted into pending queue
+  | 'message.completed' // accepted user message completed execution
+  | 'message.failed'; // user message delivery failed or was canceled
 
 // ---------------------------------------------------------------------------
 // Server -> Client Events (/stream endpoint)

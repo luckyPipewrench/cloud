@@ -1118,9 +1118,15 @@ describe('createSessionManager', () => {
 
       await mgr.createAndStart(input);
 
-      expect(config.prepare).toHaveBeenCalledWith(input);
+      expect(config.prepare).toHaveBeenCalledWith({
+        ...input,
+        initialMessageId: expect.stringMatching(/^msg_/),
+      });
+      const prepareMock = jest.mocked(config.prepare);
+      const preparedInput = prepareMock.mock.calls[0]?.[0];
       expect(config.initiate).toHaveBeenCalledWith({
         cloudAgentSessionId: cloudAgentId('agent-new'),
+        messageId: preparedInput?.initialMessageId,
       });
       expect(config.fetchSession).toHaveBeenCalledWith(kiloId('ses-new'));
     });

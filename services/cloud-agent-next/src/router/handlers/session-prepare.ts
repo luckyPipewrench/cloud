@@ -29,6 +29,7 @@ import { WrapperClient } from '../../kilo/wrapper-client.js';
 import { withDORetry } from '../../utils/do-retry.js';
 import { generateKiloSessionId } from '../../utils/kilo-session-id.js';
 import { SANDBOX_SLEEP_AFTER_SECONDS } from '../../core/lease.js';
+import { createMessageId } from '../../session/message-id.js';
 
 type SessionPrepareHandlers = {
   prepareSession: typeof prepareSessionHandler;
@@ -97,6 +98,8 @@ const prepareSessionHandler = internalApiProtectedProcedure
   .mutation(async ({ input, ctx }) => {
     return withLogTags({ source: 'prepareSession' }, async () => {
       const sessionService = new SessionService();
+      const initialMessageId =
+        input.initialMessageId ?? (input.autoInitiate ? createMessageId() : undefined);
 
       // 1. Generate new cloudAgentSessionId and sandboxId
       const cloudAgentSessionId = generateSessionId();
@@ -202,6 +205,13 @@ const prepareSessionHandler = internalApiProtectedProcedure
       // --- Fast path: autoInitiate returns immediately, runs preparation asynchronously ---
       if (input.autoInitiate) {
         logger.info('autoInitiate=true: fast-path return, async preparation');
+        if (initialMessageId === undefined) {
+          throw new TRPCError({
+            code: 'INTERNAL_SERVER_ERROR',
+            message: 'initialMessageId is required for autoInitiate sessions',
+          });
+        }
+        const autoInitiateInitialMessageId = initialMessageId;
 
         // Generate kiloSessionId upfront so the ID is stable from the start (no URL rewriting)
         const kiloSessionId = generateKiloSessionId();
@@ -251,7 +261,7 @@ const prepareSessionHandler = internalApiProtectedProcedure
           githubRepo: input.githubRepo,
           gitUrl: input.gitUrl,
           platform: input.platform,
-          initialMessageId: input.initialMessageId,
+          initialMessageId: autoInitiateInitialMessageId,
         });
 
         if (!registerResult.success) {
@@ -298,7 +308,7 @@ const prepareSessionHandler = internalApiProtectedProcedure
             gateThreshold: input.gateThreshold,
             kilocodeOrganizationId: input.kilocodeOrganizationId,
             autoInitiate: true,
-            initialMessageId: input.initialMessageId,
+            initialMessageId: autoInitiateInitialMessageId,
           });
         } catch (error) {
           await rollbackCliSession();
@@ -506,7 +516,7 @@ const prepareSessionHandler = internalApiProtectedProcedure
           images: input.images,
           createdOnPlatform: input.createdOnPlatform,
           gateThreshold: input.gateThreshold,
-          initialMessageId: input.initialMessageId,
+          initialMessageId: initialMessageId,
           // Workspace metadata
           workspacePath,
           sessionHome,

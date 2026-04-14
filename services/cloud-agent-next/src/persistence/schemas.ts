@@ -1,4 +1,5 @@
 import * as z from 'zod';
+import { MESSAGE_ID_FORMAT_DESCRIPTION, MESSAGE_ID_PATTERN } from '../session/message-id.js';
 import { AgentModeSchema, Limits } from '../schema.js';
 import type { SandboxId } from '../types.js';
 
@@ -199,7 +200,7 @@ export const MetadataSchema = z.object({
     .optional(),
 
   // Initial message ID for correlation
-  initialMessageId: z.string().startsWith('msg_').length(30).optional(),
+  initialMessageId: z.string().regex(MESSAGE_ID_PATTERN, MESSAGE_ID_FORMAT_DESCRIPTION).optional(),
 });
 
 /**
@@ -207,7 +208,7 @@ export const MetadataSchema = z.object({
  * Single source of truth for the shape of data passed between
  * startPreparationAsync (write) and runPreparationAsync (read via alarm).
  */
-export const PreparationInputSchema = z.object({
+const PreparationInputBaseSchema = z.object({
   // Session identity
   sessionId: z.string(),
   kiloSessionId: z.string().optional(),
@@ -242,10 +243,19 @@ export const PreparationInputSchema = z.object({
   shallow: z.boolean().optional(),
   gateThreshold: z.enum(['off', 'all', 'warning', 'critical']).optional(),
   kilocodeOrganizationId: z.string().optional(),
-  // Auto-initiate after preparation
-  autoInitiate: z.boolean(),
-
-  initialMessageId: z.string().optional(),
 });
+
+const InitialMessageIdSchema = z.string().regex(MESSAGE_ID_PATTERN, MESSAGE_ID_FORMAT_DESCRIPTION);
+
+export const PreparationInputSchema = z.discriminatedUnion('autoInitiate', [
+  PreparationInputBaseSchema.extend({
+    autoInitiate: z.literal(true),
+    initialMessageId: InitialMessageIdSchema,
+  }),
+  PreparationInputBaseSchema.extend({
+    autoInitiate: z.literal(false),
+    initialMessageId: InitialMessageIdSchema.optional(),
+  }),
+]);
 
 export type PreparationInput = z.infer<typeof PreparationInputSchema>;

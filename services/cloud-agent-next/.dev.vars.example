@@ -34,8 +34,6 @@ WORKER_URL=http://192.168.x.x:8794
 # Timeout overrides (optional)
 CLI_TIMEOUT_SECONDS=900
 REAPER_INTERVAL_MS=300000
-STALE_THRESHOLD_MS=600000
-PENDING_START_TIMEOUT_MS=300000
 
 # Per-session sandbox org IDs (optional)
 # Comma-separated list of org IDs that use per-session sandboxes, or `*` for all orgs
@@ -58,11 +56,9 @@ GITHUB_APP_ID=2245043
 # @pkcs8
 GITHUB_APP_PRIVATE_KEY=
 
-# GitHub Lite App credentials (for OSS organizations with read-only permissions)
-# Same format as standard app credentials above
+# GitHub Lite App ID for OSS organizations with read-only permissions.
+# Store the Lite App private key as a secret, not in committed var templates.
 GITHUB_LITE_APP_ID=
-# @pkcs8
-GITHUB_LITE_APP_PRIVATE_KEY=
 
 # GitHub Lite App slug and bot user ID for git commit attribution (optional)
 GITHUB_LITE_APP_SLUG=

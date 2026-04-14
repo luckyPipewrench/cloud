@@ -84,6 +84,7 @@ type PrepareInput = {
   upstreamBranch?: string;
   autoCommit?: boolean;
   profileName?: string;
+  initialMessageId?: string;
 };
 
 type SessionManagerConfig = {
@@ -102,7 +103,10 @@ type SessionManagerConfig = {
   prepare: (
     input: PrepareInput
   ) => Promise<{ cloudAgentSessionId: CloudAgentSessionId; kiloSessionId: KiloSessionId }>;
-  initiate: (input: { cloudAgentSessionId: CloudAgentSessionId }) => Promise<unknown>;
+  initiate: (input: {
+    cloudAgentSessionId: CloudAgentSessionId;
+    messageId?: string;
+  }) => Promise<unknown>;
   fetchSession: (kiloSessionId: KiloSessionId) => Promise<FetchedSessionData>;
   onKiloSessionCreated?: (kiloSessionId: KiloSessionId) => void;
   onComplete?: () => void;
@@ -724,8 +728,12 @@ function createSessionManager(config: SessionManagerConfig): SessionManager {
 
   async function createAndStart(input: PrepareInput): Promise<void> {
     try {
-      const { cloudAgentSessionId, kiloSessionId } = await config.prepare(input);
-      await config.initiate({ cloudAgentSessionId });
+      const initialMessageId = input.initialMessageId ?? generateMessageId();
+      const { cloudAgentSessionId, kiloSessionId } = await config.prepare({
+        ...input,
+        initialMessageId,
+      });
+      await config.initiate({ cloudAgentSessionId, messageId: initialMessageId });
       store.set(sessionIdAtom, cloudAgentSessionId);
       await switchSession(kiloSessionId);
     } catch (err) {

@@ -259,9 +259,14 @@ async function main() {
           lifecycleManager?.triggerDrainAndClose();
         }
         if (cmd.type === 'ping') {
+          const job = state.currentJob;
           state.sendToIngest({
             streamEventType: 'pong',
-            data: { executionId: state.currentJob?.executionId },
+            data: {
+              executionId: job?.executionId,
+              wrapperGeneration: job?.wrapperGeneration,
+              wrapperConnectionId: job?.wrapperConnectionId,
+            },
             timestamp: new Date().toISOString(),
           });
         }

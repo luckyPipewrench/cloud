@@ -90,7 +90,6 @@ describe('WrapperState', () => {
       it('is idempotent for same executionId', () => {
         const context = createJobContext({ executionId: 'exc_same' });
         state.startJob(context);
-
         state.startJob(context);
 
         expect(state.currentJob).toEqual(context);

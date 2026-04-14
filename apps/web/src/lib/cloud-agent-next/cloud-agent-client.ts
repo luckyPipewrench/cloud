@@ -100,6 +100,7 @@ export type PrepareSessionInput = {
   gateThreshold?: 'off' | 'all' | 'warning' | 'critical';
   /** When true, return immediately and run preparation asynchronously */
   autoInitiate?: boolean;
+  initialMessageId?: string | null;
 };
 
 /** Output from prepareSession procedure */
@@ -113,6 +114,7 @@ export type PrepareSessionOutput = {
 export type InitiateFromPreparedSessionInput = {
   cloudAgentSessionId: string;
   kilocodeOrganizationId?: string;
+  messageId?: string;
 };
 
 /** Input for sendMessage procedure (V2 - uses cloudAgentSessionId) */
@@ -131,7 +133,7 @@ export type SendMessageInput = {
   /** Custom text to append to the system prompt */
   appendSystemPrompt?: string;
   /** Message ID for correlating the request */
-  messageId?: string;
+  messageId?: string | null;
 };
 
 /** Output from V2 mutation procedures (WebSocket-based) */
@@ -140,6 +142,8 @@ export type InitiateSessionOutput = {
   executionId: string;
   status: 'started';
   streamUrl: string;
+  messageId: string;
+  delivery: 'sent' | 'queued';
 };
 
 /** Input for getSession procedure */

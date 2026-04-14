@@ -1,6 +1,6 @@
 # Cloud-Agent WebSockets: Core Diagrams
 
-These diagrams capture the core loops/patterns for the direct execution model,
+These diagrams capture the core loops/patterns for queue-first V2 acceptance,
 DO ingestion + replay, and client reconnect.
 
 ---
@@ -24,7 +24,7 @@ flowchart LR
 
 ---
 
-## 2) Direct execution handoff
+## 2) Queue-first handoff
 
 ```mermaid
 sequenceDiagram
@@ -36,19 +36,14 @@ sequenceDiagram
   C->>W: initiate/sendMessage V2
   W->>DO: startExecutionV2(...)
 
-  DO->>DO: check for active execution
+  DO->>DO: persist pending message
+  DO-->>W: status=started, delivery=queued
+  DO->>DO: alarm flushes pending message
+  DO->>DO: ExecutionOrchestrator.execute()
+  DO->>SB: send prompt to wrapper
+  SB->>DO: wrapper /ingest WS events
 
-  alt no active execution
-    DO->>DO: set activeExecutionId
-    DO->>DO: ExecutionOrchestrator.execute()
-    DO->>SB: prepare workspace + start wrapper
-    SB->>DO: wrapper /ingest WS events
-    DO-->>W: status=started
-  else active exists
-    DO-->>W: 409 Conflict (EXECUTION_IN_PROGRESS)
-  end
-
-  W-->>C: ack {cloudAgentSessionId, executionId, status, streamUrl}
+  W-->>C: ack {cloudAgentSessionId, executionId, status, streamUrl, messageId, delivery}
 ```
 
 ---
@@ -80,7 +75,7 @@ sequenceDiagram
     Wrap->>DO: kilocode/output/error events
   end
   Wrap->>DO: message.updated (completed)
-  DO->>DO: clear activeExecutionId
+  DO->>DO: mark execution completed
 ```
 
 ---
@@ -181,14 +176,15 @@ sequenceDiagram
   B->>W: initiateFromKilocodeSessionV2
   W->>DO: startExecutionV2(kind=initiatePrepared)
   DO->>DO: tryInitiate() sets initiatedAt
-  DO->>SB: ExecutionOrchestrator.execute()
-  DO-->>W: status=started
+  DO->>DO: persist pending message
+  DO-->>W: status=started, delivery=queued
+  DO->>SB: ExecutionOrchestrator.execute() during flush
 
   SB->>DO: /ingest WS (streaming)
 
   B->>W: sendMessageV2 (follow-up)
   W->>DO: startExecutionV2(kind=followup)
-  DO-->>W: status=started (or 409 if busy)
+  DO-->>W: status=started, delivery=queued
 ```
 
 ---
@@ -198,14 +194,14 @@ sequenceDiagram
 ```mermaid
 flowchart TD
   A[Client Request] --> B{DO startExecutionV2}
-  B -->|Active execution| C[409 Conflict]
-  B -->|No active| D[ExecutionOrchestrator]
-  D -->|Sandbox connect fail| E[503 SANDBOX_CONNECT_FAILED]
-  D -->|Workspace setup fail| F[503 WORKSPACE_SETUP_FAILED]
-  D -->|Kilo server fail| G[503 KILO_SERVER_FAILED]
-  D -->|Wrapper start fail| H[503 WRAPPER_START_FAILED]
-  D -->|Success| I[200 Started]
+  B -->|Pending message stored| Q[200 Started delivery=queued]
+  B -->|Idempotent replay after wrapper already accepted| I[200 Started delivery=sent]
+  B -->|Legacy compatibility gate| C[409 Conflict]
+  B -->|Sandbox connect fail| E[503 SANDBOX_CONNECT_FAILED]
+  B -->|Workspace setup fail| F[503 WORKSPACE_SETUP_FAILED]
+  B -->|Kilo server fail| G[503 KILO_SERVER_FAILED]
+  B -->|Wrapper start fail| H[503 WRAPPER_START_FAILED]
 
   E & F & G & H -->|Client retries| A
-  C -->|Client waits/polls| A
+  C -->|Legacy clients wait/poll| A
 ```

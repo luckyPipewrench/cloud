@@ -24,7 +24,11 @@ export type JobContext = {
   ingestUrl: string;
   ingestToken: string;
   workerAuthToken: string;
+  wrapperGeneration?: number;
+  wrapperConnectionId?: string;
 };
+
+export type ExecutionBindingUpdate = Omit<JobContext, 'kiloSessionId'>;
 
 export type LastError = {
   code: string;
@@ -109,6 +113,34 @@ export class WrapperState {
     this.job = context;
     this._lastError = null;
     this.updateActivity();
+  }
+
+  updateJobBinding(binding: ExecutionBindingUpdate): { changed: boolean } {
+    if (!this.job || this.job.executionId !== binding.executionId) {
+      throw new Error('Cannot update binding for a different execution');
+    }
+
+    const changed =
+      this.job.ingestUrl !== binding.ingestUrl ||
+      this.job.ingestToken !== binding.ingestToken ||
+      this.job.workerAuthToken !== binding.workerAuthToken ||
+      this.job.wrapperGeneration !== binding.wrapperGeneration ||
+      this.job.wrapperConnectionId !== binding.wrapperConnectionId;
+
+    if (!changed) {
+      return { changed: false };
+    }
+
+    this.job = {
+      ...this.job,
+      ingestUrl: binding.ingestUrl,
+      ingestToken: binding.ingestToken,
+      workerAuthToken: binding.workerAuthToken,
+      wrapperGeneration: binding.wrapperGeneration,
+      wrapperConnectionId: binding.wrapperConnectionId,
+    };
+    this.updateActivity();
+    return { changed: true };
   }
 
   /**

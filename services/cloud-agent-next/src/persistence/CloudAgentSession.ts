@@ -31,6 +31,11 @@ import {
   type LeaseAcquireError,
 } from '../session/queries/index.js';
 import { createExecutionId } from '../types/ids.js';
+import {
+  MESSAGE_ID_FORMAT_DESCRIPTION,
+  createMessageId,
+  isCanonicalMessageId,
+} from '../session/message-id.js';
 import type { ExecutionId, EventSourceId, EventId, SessionId, UserId } from '../types/ids.js';
 import type {
   ExecutionMetadata,
@@ -39,11 +44,7 @@ import type {
 } from '../session/types.js';
 import type { ExecutionStatus } from '../core/execution.js';
 import type { Result } from '../lib/result.js';
-import type {
-  AddExecutionError,
-  UpdateStatusError,
-  SetActiveError,
-} from '../session/queries/executions.js';
+import type { AddExecutionError, UpdateStatusError } from '../session/queries/executions.js';
 import { createStreamHandler, type StreamHandler } from '../websocket/stream.js';
 import {
   createIngestHandler,
@@ -57,13 +58,14 @@ import type {
   PreparingEventData,
   CloudStatusData,
 } from '../shared/protocol.js';
-import { STALE_THRESHOLD_MS, SANDBOX_SLEEP_AFTER_SECONDS } from '../core/lease.js';
+import { SANDBOX_SLEEP_AFTER_SECONDS } from '../core/lease.js';
 import { ExecutionOrchestrator, type OrchestratorDeps } from '../execution/orchestrator.js';
 import type {
   ExecutionMode,
   ExecutionPlan,
   StartExecutionV2Request,
   StartExecutionV2Result,
+  StartExecutionDelivery,
   InitializeContext,
   TokenResumeContext,
 } from '../execution/types.js';
@@ -77,6 +79,30 @@ import { getSandbox } from '@cloudflare/sandbox';
 import { stopWrapper } from '../kilo/wrapper-manager.js';
 import { SessionService } from '../session-service.js';
 import { executePreparationSteps } from './async-preparation.js';
+import {
+  checkPendingSessionMessageCapacity,
+  clearPendingSessionMessages,
+  countPendingSessionMessages,
+  type PendingSessionExecutionKind,
+  type PendingSessionMessage,
+} from '../session/pending-messages.js';
+import {
+  enqueuePendingSessionMessage,
+  flushNextPendingSessionMessage,
+  getQueuedMessageByMessageId,
+} from '../session/session-message-queue.js';
+import {
+  allocateWrapperRuntimeState,
+  clearCurrentWrapperRuntimeFailureState,
+  clearCurrentWrapperRuntimeLivenessState,
+  clearWrapperRuntimeIdentityForExecution,
+  getWrapperRuntimeState,
+  isCurrentWrapperConnection,
+  markWrapperPingSent,
+  recordMeaningfulWrapperOutput,
+  recordWrapperAcceptedMessage,
+  recordWrapperPong,
+} from '../session/wrapper-runtime-state.js';
 
 // ---------------------------------------------------------------------------
 // Alarm Constants
@@ -84,11 +110,8 @@ import { executePreparationSteps } from './async-preparation.js';
 
 /** Reaper alarm interval: 5 minutes */
 const REAPER_INTERVAL_MS_DEFAULT = 5 * 60 * 1000;
-/** Shorter reaper interval while execution is active: 2 minutes */
-const REAPER_ACTIVE_INTERVAL_MS = 2 * 60 * 1000;
-/** Longer reaper interval when idle (no active execution): 1 hour */
+/** Longer reaper interval when idle: 1 hour */
 const REAPER_IDLE_INTERVAL_MS = 60 * 60 * 1000;
-const PENDING_START_TIMEOUT_MS_DEFAULT = 3 * 60 * 1000;
 
 /** Event retention period: 90 days (aligns with session TTL) */
 const EVENT_RETENTION_MS = Limits.SESSION_TTL_MS;
@@ -102,12 +125,14 @@ const KILO_SERVER_IDLE_TIMEOUT_MS_DEFAULT = 15 * 60 * 1000;
 /** Default per-execution wall-clock deadline: 30 minutes */
 const DEFAULT_MAX_RUNTIME_MS = 1_800_000;
 
-/** Hung execution timeout: no non-heartbeat events for 5 minutes */
-const HUNG_EXECUTION_TIMEOUT_MS = 5 * 60 * 1000;
+const WRAPPER_NO_OUTPUT_TIMEOUT_MS = 5 * 60 * 1000;
 
 /** Grace period before failing execution after wrapper disconnect (ms).
  *  Covers the first few reconnection attempts (exponential backoff: 1s, 2s, 4s …). */
 const DISCONNECT_GRACE_MS = 10_000;
+const WRAPPER_PING_INTERVAL_MS = 60_000;
+const WRAPPER_PING_TIMEOUT_MS = 30_000;
+const PENDING_FLUSH_DEBOUNCE_MS = 1_000;
 
 /** DO storage key for persisting disconnect grace state across hibernation. */
 const DISCONNECT_GRACE_KEY = 'disconnect_grace';
@@ -121,6 +146,8 @@ type DisconnectGraceState = {
   disconnectedAt: number;
   wsCloseCode: number;
   wsCloseReason: string;
+  wrapperGeneration?: number;
+  wrapperConnectionId?: string;
 };
 
 export class CloudAgentSession extends DurableObject {
@@ -140,11 +167,12 @@ export class CloudAgentSession extends DurableObject {
   }
 
   private async enqueueCallbackNotification(
-    executionId: ExecutionId,
+    execution: ExecutionMetadata,
     status: 'completed' | 'failed' | 'interrupted',
     error?: string,
     gateResult?: 'pass' | 'fail'
   ): Promise<void> {
+    const { executionId, messageId } = execution;
     const metadata = await this.getMetadata();
     const callbackQueue = (this.env as unknown as WorkerEnv).CALLBACK_QUEUE;
 
@@ -156,24 +184,30 @@ export class CloudAgentSession extends DurableObject {
       cloudAgentSessionId: metadata.sessionId,
       kiloSessionId: metadata.kiloSessionId,
       executionId,
-      callbackUrl: metadata.callbackTarget.url,
+      callbackTarget: this.redactCallbackTargetUrl(metadata.callbackTarget.url),
     });
 
     const resolvedSessionId = await this.resolveSessionId(metadata.sessionId as SessionId);
     const sessionId = resolvedSessionId ?? metadata.sessionId ?? '';
 
+    const payload: CallbackJob['payload'] = {
+      sessionId,
+      cloudAgentSessionId: sessionId,
+      executionId,
+      status,
+      errorMessage: error,
+      lastSeenBranch: metadata.upstreamBranch,
+      kiloSessionId: metadata.kiloSessionId,
+      gateResult,
+    };
+
+    if (messageId) {
+      payload.messageId = messageId;
+    }
+
     const callbackJob: CallbackJob = {
       target: metadata.callbackTarget,
-      payload: {
-        sessionId,
-        cloudAgentSessionId: sessionId,
-        executionId,
-        status,
-        errorMessage: error,
-        lastSeenBranch: metadata.upstreamBranch,
-        kiloSessionId: metadata.kiloSessionId,
-        gateResult,
-      },
+      payload,
     };
 
     // Fire-and-forget enqueue - don't block execution completion
@@ -272,9 +306,26 @@ export class CloudAgentSession extends DurableObject {
       const doContext: IngestDOContext = {
         updateKiloSessionId: (id: string) => this.updateKiloSessionId(id),
         updateUpstreamBranch: (branch: string) => this.updateUpstreamBranch(branch),
-        clearActiveExecution: () => this.clearActiveExecution(),
-        getActiveExecutionId: () => this.executionQueries.getActiveExecutionId(),
-        cancelDisconnectGrace: () => this.cancelDisconnectGrace(),
+        cancelDisconnectGrace: (wrapperGeneration, wrapperConnectionId) =>
+          this.cancelDisconnectGrace({ wrapperGeneration, wrapperConnectionId }),
+        isCurrentWrapperConnection: (wrapperGeneration, wrapperConnectionId) =>
+          isCurrentWrapperConnection(this.ctx.storage, wrapperGeneration, wrapperConnectionId),
+        recordWrapperPong: (wrapperGeneration, wrapperConnectionId, now) =>
+          recordWrapperPong(
+            this.ctx.storage,
+            wrapperGeneration,
+            wrapperConnectionId,
+            now,
+            now + WRAPPER_PING_INTERVAL_MS
+          ).then(() => undefined),
+        recordMeaningfulWrapperOutput: (wrapperGeneration, wrapperConnectionId, now) =>
+          recordMeaningfulWrapperOutput(
+            this.ctx.storage,
+            wrapperGeneration,
+            wrapperConnectionId,
+            now,
+            now + WRAPPER_PING_INTERVAL_MS
+          ).then(() => undefined),
         getExecution: async (executionId: string) => {
           const execution = await this.executionQueries.get(executionId as ExecutionId);
           if (!execution) return null;
@@ -408,7 +459,7 @@ export class CloudAgentSession extends DurableObject {
     // Check if this is an ingest connection
     if (tags.some(tag => tag.startsWith('ingest:'))) {
       const ingestHandler = await this.getIngestHandler();
-      void ingestHandler.handleIngestMessage(ws, message);
+      await ingestHandler.handleIngestMessage(ws, message);
       return;
     }
 
@@ -431,17 +482,24 @@ export class CloudAgentSession extends DurableObject {
     // Clean up ingest connection tracking
     if (tags.some(tag => tag.startsWith('ingest:'))) {
       const ingestHandler = await this.getIngestHandler();
-      const disconnectedExecutionId = ingestHandler.handleIngestClose(ws);
+      const disconnected = await ingestHandler.handleIngestClose(ws);
 
-      // If the wrapper disconnected while its execution was still active, start a
+      // If the current wrapper disconnected while its execution was still active, start a
       // grace period before failing. This gives the wrapper time to reconnect
-      // (exponential backoff: 1s, 2s, 4s …).
-      if (disconnectedExecutionId) {
-        const activeExecutionId = await this.executionQueries.getActiveExecutionId();
-        if (activeExecutionId === disconnectedExecutionId) {
-          const execution = await this.executionQueries.get(activeExecutionId);
+      // (exponential backoff: 1s, 2s, 4s ...).
+      if (disconnected) {
+        const state = await getWrapperRuntimeState(this.ctx.storage);
+        const runtimeExecutionId = state.acceptedExecutionId ?? state.wrapperExecutionId;
+        const isCurrentConnection =
+          disconnected.wrapperGeneration === undefined ||
+          disconnected.wrapperConnectionId === undefined
+            ? state.wrapperConnectionId === undefined
+            : state.wrapperGeneration === disconnected.wrapperGeneration &&
+              state.wrapperConnectionId === disconnected.wrapperConnectionId;
+        if (isCurrentConnection && runtimeExecutionId === disconnected.executionId) {
+          const execution = await this.executionQueries.get(disconnected.executionId);
           if (execution && (execution.status === 'running' || execution.status === 'pending')) {
-            await this.startDisconnectGrace(activeExecutionId, code, reason);
+            await this.startDisconnectGrace(disconnected, code, reason);
           }
         }
       }
@@ -543,20 +601,20 @@ export class CloudAgentSession extends DurableObject {
    * Used to populate the `connected` event on WebSocket upgrade.
    */
   private async deriveCloudStatus(): Promise<CloudStatusData['cloudStatus'] | null> {
-    const activeExecId = await this.executionQueries.getActiveExecutionId();
-    if (!activeExecId) {
+    const runtimeExecutionId = await this.getCurrentWrapperRuntimeExecutionId();
+    if (!runtimeExecutionId) {
       const metadata = await this.ctx.storage.get<CloudAgentSessionState>('metadata');
       return metadata?.preparedAt ? { type: 'ready' } : null;
     }
 
-    const exec = await this.executionQueries.get(activeExecId);
+    const exec = await this.executionQueries.get(runtimeExecutionId);
     if (!exec) return null;
 
     if (exec.status === 'pending') {
       return { type: 'preparing' };
     }
 
-    // Running executions mean the agent has control — infrastructure is ready
+    // Running executions mean the agent has control - infrastructure is ready
     return { type: 'ready' };
   }
 
@@ -762,29 +820,41 @@ export class CloudAgentSession extends DurableObject {
    * Best-effort: silently does nothing if no wrapper is connected.
    */
   private requestKiloSnapshot(): void {
-    void this.executionQueries.getActiveExecutionId().then(activeExecId => {
-      if (!activeExecId) return;
-      this.sendToWrapper(activeExecId, { type: 'request_snapshot' });
+    void this.getCurrentWrapperRuntimeExecutionId().then(executionId => {
+      if (!executionId) return;
+      this.sendToWrapper(executionId, { type: 'request_snapshot' });
     });
   }
 
   /**
-   * Interrupt the currently active execution by sending a kill command to the wrapper.
+   * Interrupt the current wrapper runtime execution by sending a kill command to the wrapper.
    * Returns success/failure status.
    *
    * @returns Result indicating if the interrupt was initiated
    */
-  async interruptExecution(): Promise<{ success: boolean; message?: string }> {
-    const activeExecutionId = await this.executionQueries.getActiveExecutionId();
+  async interruptExecution(): Promise<{
+    success: boolean;
+    executionId?: ExecutionId;
+    message?: string;
+  }> {
+    const runtimeExecutionId = await this.getCurrentWrapperRuntimeExecutionId();
+    const targetExecutionId = runtimeExecutionId ?? undefined;
+    const clearedMessages = await clearPendingSessionMessages(this.ctx.storage);
 
-    if (!activeExecutionId) {
-      return { success: false, message: 'No active execution' };
+    if (targetExecutionId) {
+      // Send kill command directly to wrapper
+      this.sendToWrapper(targetExecutionId, { type: 'kill', signal: 'SIGTERM' });
     }
 
-    // Send kill command directly to wrapper
-    this.sendToWrapper(activeExecutionId, { type: 'kill', signal: 'SIGTERM' });
+    for (const message of clearedMessages) {
+      await this.emitPendingMessageInterrupted(message);
+    }
 
-    return { success: true };
+    if (!targetExecutionId && clearedMessages.length === 0) {
+      return { success: false, message: 'No current runtime execution or pending queued messages' };
+    }
+
+    return { success: true, executionId: targetExecutionId };
   }
 
   /**
@@ -943,11 +1013,9 @@ export class CloudAgentSession extends DurableObject {
    * itself up via the alarm even if the original worker request has ended.
    */
   async startPreparationAsync(input: PreparationInput): Promise<void> {
-    await this.ctx.storage.put(PENDING_PREPARATION_KEY, input);
-    // Schedule an immediate alarm to run the preparation.
-    // If an alarm is already pending (e.g. reaper), setAlarm replaces it —
-    // the reaper will self-reschedule when it next runs.
-    await this.ctx.storage.setAlarm(Date.now());
+    const parsed = PreparationInputSchema.parse(input);
+    await this.ctx.storage.put(PENDING_PREPARATION_KEY, parsed);
+    await this.scheduleAlarmAtOrBefore(Date.now());
   }
 
   /**
@@ -1078,6 +1146,7 @@ export class CloudAgentSession extends DurableObject {
           userId: input.userId as UserId,
           botId: input.botId,
           authToken: input.authToken,
+          messageId: input.initialMessageId,
         });
 
         if (!initiateResult.success) {
@@ -1224,11 +1293,8 @@ export class CloudAgentSession extends DurableObject {
 
   /**
    * Alarm handler for periodic cleanup tasks.
-   * Runs every REAPER_INTERVAL_MS to:
-   * 1. Clean up stale executions (no heartbeat for STALE_THRESHOLD_MS)
-   * 2. Clean up old events (older than EVENT_RETENTION_MS)
-   * 3. Clean up expired leases
-   * 4. Check if session should be deleted due to inactivity
+   * Runs periodic retention/TTL cleanup and schedules nearer deadlines for
+   * pending message flushes, disconnect grace, wrapper liveness, and max runtime.
    */
   async alarm(): Promise<void> {
     const now = Date.now();
@@ -1236,6 +1302,8 @@ export class CloudAgentSession extends DurableObject {
     logger
       .withFields({ doId: this.ctx.id.toString(), sessionId: this.sessionId })
       .info('Alarm fired');
+
+    let pendingFlushRetryAt: number | undefined;
 
     try {
       // Run pending async preparation if scheduled.
@@ -1313,16 +1381,9 @@ export class CloudAgentSession extends DurableObject {
         .withFields({ sessionId: this.sessionId, lastActivity, elapsedMs: Date.now() - now })
         .debug('TTL check passed');
 
-      // Run cleanup tasks
-      logger
-        .withFields({ sessionId: this.sessionId, elapsedMs: Date.now() - now })
-        .debug('Starting cleanupStaleExecutions');
-      await this.cleanupStaleExecutions(now);
+      await this.checkWrapperLiveness(now);
 
-      logger
-        .withFields({ sessionId: this.sessionId, elapsedMs: Date.now() - now })
-        .debug('Starting checkHungExecution');
-      await this.checkHungExecution(now);
+      // Run cleanup tasks
 
       logger
         .withFields({ sessionId: this.sessionId, elapsedMs: Date.now() - now })
@@ -1345,6 +1406,8 @@ export class CloudAgentSession extends DurableObject {
         .debug('Starting cleanupIdleKiloServer');
       await this.cleanupIdleKiloServer(now);
 
+      pendingFlushRetryAt = await this.flushOnePendingSessionMessage();
+
       logger
         .withFields({ sessionId: this.sessionId, elapsedMs: Date.now() - now })
         .debug('All cleanup steps completed');
@@ -1360,24 +1423,45 @@ export class CloudAgentSession extends DurableObject {
         .error('Error during alarm reaper');
     }
 
-    // Schedule next alarm run — use shorter interval while an execution is active,
-    // longer idle interval otherwise so we don't wake the DO every 5 min for nothing.
+    // Schedule next alarm run from the nearest pending deadline, retry pending
+    // work promptly when idle, and otherwise use the long idle cadence.
     // Wrapped in try/catch so a failure here never prevents rescheduling the alarm.
-    let nextInterval = REAPER_IDLE_INTERVAL_MS;
+    let nextAlarmAt = Date.now() + REAPER_IDLE_INTERVAL_MS;
     try {
-      const activeExecutionId = await this.executionQueries.getActiveExecutionId();
-      if (activeExecutionId) {
-        nextInterval = REAPER_ACTIVE_INTERVAL_MS;
+      const remainingPendingCount = await countPendingSessionMessages(this.ctx.storage);
+      const currentTime = Date.now();
+      const deadlines = await this.getNextAlarmDeadlines();
+      if (pendingFlushRetryAt !== undefined) {
+        deadlines.push(pendingFlushRetryAt);
+      }
+
+      for (const deadline of deadlines) {
+        const clampedDeadline = deadline <= currentTime ? currentTime + 1_000 : deadline;
+        if (clampedDeadline < nextAlarmAt) {
+          nextAlarmAt = clampedDeadline;
+        }
+      }
+
+      if (
+        pendingFlushRetryAt === undefined &&
+        remainingPendingCount > 0 &&
+        currentTime + PENDING_FLUSH_DEBOUNCE_MS < nextAlarmAt
+      ) {
+        nextAlarmAt = currentTime + PENDING_FLUSH_DEBOUNCE_MS;
       }
     } catch {
       // Can't determine state — use a conservative short interval so the
       // reaper retries soon rather than sleeping for an hour.
-      nextInterval = REAPER_INTERVAL_MS_DEFAULT;
+      nextAlarmAt = Date.now() + REAPER_INTERVAL_MS_DEFAULT;
     }
     logger
-      .withFields({ sessionId: this.sessionId, nextInterval, elapsedMs: Date.now() - now })
+      .withFields({
+        sessionId: this.sessionId,
+        nextInterval: Math.max(0, nextAlarmAt - Date.now()),
+        elapsedMs: Date.now() - now,
+      })
       .info('Rescheduling alarm');
-    await this.ctx.storage.setAlarm(Date.now() + nextInterval);
+    await this.ctx.storage.setAlarm(nextAlarmAt);
   }
 
   /**
@@ -1391,6 +1475,24 @@ export class CloudAgentSession extends DurableObject {
     }
   }
 
+  private async scheduleAlarmAtOrBefore(deadline: number): Promise<void> {
+    const now = Date.now();
+    const clampedDeadline = deadline <= now ? now + 1_000 : deadline;
+    const existingAlarm = await this.ctx.storage.getAlarm();
+    if (existingAlarm === null || clampedDeadline < existingAlarm) {
+      await this.ctx.storage.setAlarm(clampedDeadline);
+    }
+  }
+
+  private redactCallbackTargetUrl(callbackUrl: string): string {
+    try {
+      const url = new URL(callbackUrl);
+      return `${url.origin}${url.pathname}`;
+    } catch {
+      return 'invalid-url';
+    }
+  }
+
   /**
    * Update the last activity timestamp.
    * Called when metadata is modified to track session activity.
@@ -1399,124 +1501,35 @@ export class CloudAgentSession extends DurableObject {
     await this.ctx.storage.put(LAST_ACTIVITY_KEY, Date.now());
   }
 
-  /**
-   * Clean up stale executions that have stopped heartbeating.
-   * Marks them as failed and clears the active execution.
-   */
-  private async cleanupStaleExecutions(now: number): Promise<void> {
-    const activeExecutionId = await this.executionQueries.getActiveExecutionId();
-
-    if (!activeExecutionId) return;
-
-    // Get the execution metadata
-    const execution = await this.executionQueries.get(activeExecutionId);
-
-    if (!execution) {
-      // Orphaned active execution ID - clear it
-      logger
-        .withFields({ sessionId: this.sessionId, executionId: activeExecutionId })
-        .warn('Clearing orphaned active execution ID');
-      await this.executionQueries.clearActiveExecution();
-      return;
-    }
-
-    // Check if execution is stale (no heartbeat for STALE_THRESHOLD_MS)
-    if (execution.status === 'running') {
-      const staleThresholdMs = this.getStaleThresholdMs();
-      const isStale = !execution.lastHeartbeat || now - execution.lastHeartbeat > staleThresholdMs;
-
-      if (isStale) {
-        logger
-          .withFields({
-            sessionId: this.sessionId,
-            executionId: activeExecutionId,
-            lastHeartbeat: execution.lastHeartbeat,
-            staleDurationMs: execution.lastHeartbeat ? now - execution.lastHeartbeat : 'never',
-            staleThresholdMs,
-          })
-          .info('Marking stale execution as failed');
-
-        await this.failExecution({
-          executionId: activeExecutionId,
-          status: 'failed',
-          error: 'Execution timeout - no heartbeat received',
-          streamEventType: 'error',
-        });
-      }
-    }
-
-    if (execution.status === 'pending') {
-      const pendingTimeoutMs = this.getPendingStartTimeoutMs();
-      const isPendingTooLong = now - execution.startedAt > pendingTimeoutMs;
-
-      if (isPendingTooLong) {
-        logger
-          .withFields({
-            sessionId: this.sessionId,
-            executionId: activeExecutionId,
-            startedAt: execution.startedAt,
-            pendingTimeoutMs,
-          })
-          .info('Marking stuck pending execution as failed');
-
-        await this.failExecution({
-          executionId: activeExecutionId,
-          status: 'failed',
-          error: 'Execution timeout - wrapper never connected',
-          streamEventType: 'error',
-        });
-      }
-    }
+  private async getRawWrapperRuntimeExecutionId(): Promise<ExecutionId | null> {
+    const state = await getWrapperRuntimeState(this.ctx.storage);
+    const executionId = state.acceptedExecutionId ?? state.wrapperExecutionId;
+    return executionId ? (executionId as ExecutionId) : null;
   }
 
-  /**
-   * Fail a running execution that hasn't received any non-heartbeat events
-   * for HUNG_EXECUTION_TIMEOUT_MS. Skipped when lastEventAt is undefined
-   * (other checks handle that case).
-   */
-  private async checkHungExecution(now: number): Promise<void> {
-    const activeExecutionId = await this.executionQueries.getActiveExecutionId();
-    if (!activeExecutionId) return;
-
-    const execution = await this.executionQueries.get(activeExecutionId);
-    if (!execution || execution.status !== 'running') return;
-    if (execution.lastEventAt === undefined) return;
-
-    if (now - execution.lastEventAt > HUNG_EXECUTION_TIMEOUT_MS) {
-      logger
-        .withFields({
-          sessionId: this.sessionId,
-          executionId: activeExecutionId,
-          lastEventAt: execution.lastEventAt,
-          hungDurationMs: now - execution.lastEventAt,
-        })
-        .info('Marking hung execution as failed');
-
-      await this.failExecution({
-        executionId: activeExecutionId,
-        status: 'failed',
-        error: 'Execution hung — no events received for 5 minutes',
-        streamEventType: 'error',
-      });
-    }
+  private isCurrentRuntimeStatus(status: ExecutionStatus): status is 'pending' | 'running' {
+    return status === 'pending' || status === 'running';
   }
 
-  /**
-   * Fail a running execution that has exceeded its wall-clock deadline
-   * (DEFAULT_MAX_RUNTIME_MS = 30 min).
-   */
+  private async getCurrentWrapperRuntimeExecutionId(): Promise<ExecutionId | null> {
+    const execution = await this.getCurrentRuntimeExecution();
+    return execution?.executionId ?? null;
+  }
+
+  private async getMaxRuntimeExecution(): Promise<ExecutionMetadata | null> {
+    const execution = await this.getCurrentRuntimeExecution();
+    return execution?.status === 'running' ? execution : null;
+  }
+
   private async checkMaxRuntime(now: number): Promise<void> {
-    const activeExecutionId = await this.executionQueries.getActiveExecutionId();
-    if (!activeExecutionId) return;
+    const execution = await this.getMaxRuntimeExecution();
+    if (!execution) return;
 
-    const execution = await this.executionQueries.get(activeExecutionId);
-    if (!execution || execution.status !== 'running') return;
-
-    if (now - execution.startedAt > DEFAULT_MAX_RUNTIME_MS) {
+    if (now - execution.startedAt >= DEFAULT_MAX_RUNTIME_MS) {
       logger
         .withFields({
           sessionId: this.sessionId,
-          executionId: activeExecutionId,
+          executionId: execution.executionId,
           startedAt: execution.startedAt,
           maxRuntimeMs: DEFAULT_MAX_RUNTIME_MS,
           elapsedMs: now - execution.startedAt,
@@ -1524,7 +1537,7 @@ export class CloudAgentSession extends DurableObject {
         .info('Marking execution as failed — exceeded maximum runtime');
 
       await this.failExecution({
-        executionId: activeExecutionId,
+        executionId: execution.executionId,
         status: 'failed',
         error: 'Execution exceeded maximum runtime',
         streamEventType: 'error',
@@ -1557,21 +1570,9 @@ export class CloudAgentSession extends DurableObject {
     }
   }
 
-  /** Initial reaper interval used only by {@link ensureAlarmScheduled}.
-   *  Steady-state intervals are {@link REAPER_IDLE_INTERVAL_MS} / {@link REAPER_ACTIVE_INTERVAL_MS}. */
   private getReaperIntervalMs(): number {
     const value = Number((this.env as unknown as WorkerEnv).REAPER_INTERVAL_MS);
     return Number.isFinite(value) && value > 0 ? value : REAPER_INTERVAL_MS_DEFAULT;
-  }
-
-  private getStaleThresholdMs(): number {
-    const value = Number((this.env as unknown as WorkerEnv).STALE_THRESHOLD_MS);
-    return Number.isFinite(value) && value > 0 ? value : STALE_THRESHOLD_MS;
-  }
-
-  private getPendingStartTimeoutMs(): number {
-    const value = Number((this.env as unknown as WorkerEnv).PENDING_START_TIMEOUT_MS);
-    return Number.isFinite(value) && value > 0 ? value : PENDING_START_TIMEOUT_MS_DEFAULT;
   }
 
   private getKiloServerIdleTimeoutMs(): number {
@@ -1603,20 +1604,18 @@ export class CloudAgentSession extends DurableObject {
       return;
     }
 
-    // Check if there's an active execution - don't stop the server mid-run
-    const activeExecutionId = await this.executionQueries.getActiveExecutionId();
-    if (activeExecutionId !== null) {
+    const hasRuntimeWork = await this.hasWrapperRuntimeOrPendingWork();
+    if (hasRuntimeWork) {
       logger
         .withFields({
           sessionId: this.sessionId,
-          executionId: activeExecutionId,
           idleMs,
         })
-        .debug('Skipping idle kilo server cleanup - execution is active');
+        .debug('Skipping idle kilo server cleanup - wrapper or pending work is active');
       return;
     }
 
-    // Server has been idle too long and no active execution, stop it
+    // Server has been idle too long and no wrapper/pending work remains, stop it
     logger
       .withFields({
         sessionId: this.sessionId,
@@ -1662,19 +1661,24 @@ export class CloudAgentSession extends DurableObject {
         .withFields({ sessionId: this.sessionId, sandboxId })
         .info('Idle kilo server stopped successfully');
     } catch (error) {
-      // Log but don't fail - server may already be stopped or sandbox recycled
       logger
         .withFields({
           sessionId: this.sessionId,
           error: error instanceof Error ? error.message : String(error),
         })
-        .warn('Failed to stop idle kilo server (may already be stopped)');
+        .warn('Failed to stop idle kilo server');
+
+      const updated = {
+        ...metadata,
+        version: Date.now(),
+      };
+      await this.updateMetadata(updated);
     }
   }
 
   /**
    * Reset the sandbox container's sleep timer so it stays alive during an
-   * active execution.
+   * current wrapper runtime execution.
    *
    * The wrapper heartbeat travels over an outbound WebSocket that bypasses
    * `containerFetch()`, so it never calls `renewActivityTimeout()`.  Calling
@@ -1732,19 +1736,77 @@ export class CloudAgentSession extends DurableObject {
    * (orchestrator) handles the error synchronously and enqueuing a callback
    * would race with a fallback session's callbacks.
    */
+  private async emitAcceptedMessageTerminalEvent(
+    execution: ExecutionMetadata,
+    params: UpdateExecutionStatusParams,
+    status: 'completed' | 'failed' | 'interrupted'
+  ): Promise<void> {
+    if (!execution.messageId) {
+      return;
+    }
+
+    const payload: Record<string, unknown> = {
+      messageId: execution.messageId,
+      executionId: execution.executionId,
+      status,
+      delivery: 'sent',
+      accepted: true,
+    };
+
+    if (params.error !== undefined) {
+      payload.error = params.error;
+    }
+    if (params.gateResult !== undefined) {
+      payload.gateResult = params.gateResult;
+    }
+
+    const sessionId = await this.requireSessionId();
+    this.insertAndBroadcastEvent({
+      executionId: execution.executionId,
+      sessionId,
+      streamEventType: status === 'completed' ? 'message.completed' : 'message.failed',
+      payload: JSON.stringify(payload),
+      timestamp: Date.now(),
+    });
+  }
+
   async updateExecutionStatus(
     params: UpdateExecutionStatusParams,
     opts?: { suppressCallback?: boolean }
   ): Promise<Result<ExecutionMetadata, UpdateStatusError>> {
+    const existing = await this.executionQueries.get(params.executionId);
+    if (existing?.status === params.status && this.isTerminalStatus(params.status)) {
+      return { ok: true, value: existing };
+    }
+
     const result = await this.executionQueries.updateStatus(params);
 
-    if (result.ok && this.isTerminalStatus(params.status) && !opts?.suppressCallback) {
-      await this.enqueueCallbackNotification(
-        params.executionId,
-        params.status,
-        params.error,
-        params.gateResult
-      );
+    if (result.ok && this.isTerminalStatus(params.status)) {
+      const state = await getWrapperRuntimeState(this.ctx.storage);
+      if (
+        state.wrapperConnectionId &&
+        (state.wrapperExecutionId === params.executionId ||
+          state.acceptedExecutionId === params.executionId)
+      ) {
+        await clearWrapperRuntimeIdentityForExecution(
+          this.ctx.storage,
+          params.executionId,
+          {
+            wrapperGeneration: state.wrapperGeneration,
+            wrapperConnectionId: state.wrapperConnectionId,
+          },
+          { incrementGeneration: true }
+        );
+      }
+      if (!opts?.suppressCallback) {
+        await this.emitAcceptedMessageTerminalEvent(result.value, params, params.status);
+        await this.enqueueCallbackNotification(
+          result.value,
+          params.status,
+          params.error,
+          params.gateResult
+        );
+      }
     }
 
     return result;
@@ -1756,7 +1818,38 @@ export class CloudAgentSession extends DurableObject {
    * Called when the wrapper reconnects or when another codepath fails
    * the execution.
    */
-  private async cancelDisconnectGrace(): Promise<void> {
+  private async cancelDisconnectGrace(fence?: {
+    wrapperGeneration?: number;
+    wrapperConnectionId?: string;
+  }): Promise<void> {
+    const graceState = await this.ctx.storage.get<DisconnectGraceState>(DISCONNECT_GRACE_KEY);
+    if (!graceState) return;
+    if (
+      graceState.wrapperGeneration !== undefined ||
+      graceState.wrapperConnectionId !== undefined
+    ) {
+      if (fence?.wrapperGeneration === undefined || fence.wrapperConnectionId === undefined) {
+        return;
+      }
+    }
+    if (
+      fence?.wrapperGeneration !== undefined &&
+      graceState.wrapperGeneration !== fence.wrapperGeneration
+    ) {
+      return;
+    }
+    if (
+      fence?.wrapperConnectionId !== undefined &&
+      graceState.wrapperConnectionId !== fence.wrapperConnectionId
+    ) {
+      return;
+    }
+    await this.ctx.storage.delete(DISCONNECT_GRACE_KEY);
+  }
+
+  private async clearDisconnectGraceForExecution(executionId: ExecutionId): Promise<void> {
+    const graceState = await this.ctx.storage.get<DisconnectGraceState>(DISCONNECT_GRACE_KEY);
+    if (!graceState || graceState.executionId !== executionId) return;
     await this.ctx.storage.delete(DISCONNECT_GRACE_KEY);
   }
 
@@ -1766,7 +1859,11 @@ export class CloudAgentSession extends DurableObject {
    * alarm to fire at the grace deadline so it runs even if the DO sleeps.
    */
   private async startDisconnectGrace(
-    executionId: ExecutionId,
+    disconnected: {
+      executionId: ExecutionId;
+      wrapperGeneration?: number;
+      wrapperConnectionId?: string;
+    },
     wsCloseCode: number,
     wsCloseReason: string
   ): Promise<void> {
@@ -1775,7 +1872,7 @@ export class CloudAgentSession extends DurableObject {
     logger
       .withFields({
         sessionId: this.sessionId,
-        executionId,
+        executionId: disconnected.executionId,
         wsCloseCode,
         wsCloseReason,
         graceMs: DISCONNECT_GRACE_MS,
@@ -1783,17 +1880,16 @@ export class CloudAgentSession extends DurableObject {
       .warn('Wrapper disconnected — starting grace period before marking as failed');
 
     const graceState: DisconnectGraceState = {
-      executionId,
+      executionId: disconnected.executionId,
       disconnectedAt: now,
       wsCloseCode,
       wsCloseReason,
+      wrapperGeneration: disconnected.wrapperGeneration,
+      wrapperConnectionId: disconnected.wrapperConnectionId,
     };
     await this.ctx.storage.put(DISCONNECT_GRACE_KEY, graceState);
 
-    // Reschedule alarm to fire at the grace deadline. The alarm handler
-    // always reschedules itself afterward, so the normal reaper cadence
-    // self-heals once this fires.
-    await this.ctx.storage.setAlarm(now + DISCONNECT_GRACE_MS);
+    await this.scheduleAlarmAtOrBefore(now + DISCONNECT_GRACE_MS);
   }
 
   /**
@@ -1814,9 +1910,28 @@ export class CloudAgentSession extends DurableObject {
 
     const { executionId, wsCloseCode, wsCloseReason } = graceState;
 
-    // Re-check: wrapper may have reconnected during grace period
+    const state = await getWrapperRuntimeState(this.ctx.storage);
+    if (
+      graceState.wrapperGeneration !== undefined &&
+      state.wrapperGeneration !== graceState.wrapperGeneration
+    ) {
+      return;
+    }
+    if (
+      graceState.wrapperConnectionId !== undefined &&
+      state.wrapperConnectionId !== graceState.wrapperConnectionId
+    ) {
+      return;
+    }
+
     const ingestHandler = await this.getIngestHandler();
-    if (ingestHandler.hasActiveConnection(executionId)) {
+    if (
+      ingestHandler.hasActiveConnection(
+        executionId,
+        graceState.wrapperGeneration,
+        graceState.wrapperConnectionId
+      )
+    ) {
       logger
         .withFields({ executionId })
         .info('Wrapper reconnected during grace period — skipping failure');
@@ -1855,7 +1970,7 @@ export class CloudAgentSession extends DurableObject {
    *
    * Performs:
    * 1. Update execution status to terminal (enqueues callback)
-   * 2. Clear active execution (safety net)
+   * 2. Clear current wrapper runtime liveness state when applicable
    * 3. Clear interrupt flag
    * 4. Broadcast event to /stream clients
    *
@@ -1872,13 +1987,15 @@ export class CloudAgentSession extends DurableObject {
   }): Promise<boolean> {
     const { executionId, status, error, streamEventType, streamPayload } = params;
 
-    // Clear disconnect grace state — prevents double-failure if another codepath
-    // already failed the execution while a grace period was pending.
-    await this.cancelDisconnectGrace();
+    // Clear disconnect grace state for this execution. Reconnect paths use
+    // cancelDisconnectGrace with a wrapper fence so unfenced reconnects cannot
+    // cancel fenced grace, but terminal cleanup must clear fenced grace too.
+    await this.clearDisconnectGraceForExecution(executionId);
 
-    // Snapshot active execution before updateStatus clears it — we need this to
-    // decide whether to clean up the interrupt flag afterward.
-    const wasActive = (await this.executionQueries.getActiveExecutionId()) === executionId;
+    const stateBeforeUpdate = await getWrapperRuntimeState(this.ctx.storage);
+    const wasCurrentRuntimeExecution =
+      stateBeforeUpdate.wrapperExecutionId === executionId ||
+      stateBeforeUpdate.acceptedExecutionId === executionId;
 
     // 1. Update status (enqueues callback notification on terminal unless suppressed)
     const statusResult = await this.updateExecutionStatus(
@@ -1898,15 +2015,12 @@ export class CloudAgentSession extends DurableObject {
       return false;
     }
 
-    // 2. Clear active execution + interrupt only if this was the active execution.
-    //    updateStatus already clears active_execution_id internally when it matches,
-    //    so the clear here is a safety net. We skip both clears when this execution
-    //    wasn't active to avoid clobbering a newer execution that started in between.
-    if (wasActive) {
-      const activeId = await this.executionQueries.getActiveExecutionId();
-      if (activeId === executionId) {
-        await this.executionQueries.clearActiveExecution();
-      }
+    // 2. Clear interrupt only if this was the current runtime execution.
+    if (wasCurrentRuntimeExecution) {
+      await clearWrapperRuntimeIdentityForExecution(this.ctx.storage, executionId, {
+        wrapperGeneration: stateBeforeUpdate.wrapperGeneration,
+        wrapperConnectionId: stateBeforeUpdate.wrapperConnectionId,
+      });
       await this.executionQueries.clearInterrupt();
     }
 
@@ -1927,6 +2041,179 @@ export class CloudAgentSession extends DurableObject {
     return true;
   }
 
+  private async hasWrapperRuntimeOrPendingWork(): Promise<boolean> {
+    const pendingCount = await countPendingSessionMessages(this.ctx.storage);
+    if (pendingCount > 0) return true;
+
+    const currentExecution = await this.getCurrentRuntimeExecution();
+    if (currentExecution) return true;
+
+    return false;
+  }
+
+  private async getNextAlarmDeadlines(): Promise<number[]> {
+    const deadlines: number[] = [];
+    const livenessDeadline = await this.getNextWrapperLivenessDeadline();
+    if (livenessDeadline !== null) {
+      deadlines.push(livenessDeadline);
+    }
+
+    const graceState = await this.ctx.storage.get<DisconnectGraceState>(DISCONNECT_GRACE_KEY);
+    if (graceState) {
+      deadlines.push(graceState.disconnectedAt + DISCONNECT_GRACE_MS);
+    }
+
+    const maxRuntimeExecution = await this.getMaxRuntimeExecution();
+    if (maxRuntimeExecution) {
+      const maxRuntimeDeadline = maxRuntimeExecution.startedAt + DEFAULT_MAX_RUNTIME_MS;
+      deadlines.push(maxRuntimeDeadline);
+    }
+
+    return deadlines;
+  }
+
+  private async getNextWrapperLivenessDeadline(): Promise<number | null> {
+    const state = await getWrapperRuntimeState(this.ctx.storage);
+    if (!state.wrapperConnectionId) return null;
+    const executionId = state.acceptedExecutionId ?? state.wrapperExecutionId;
+    if (!executionId) return null;
+
+    const execution = await this.executionQueries.get(executionId as ExecutionId);
+    const isActive = execution?.status === 'pending' || execution?.status === 'running';
+    if (!isActive) {
+      await clearCurrentWrapperRuntimeLivenessState(
+        this.ctx.storage,
+        state.wrapperGeneration,
+        state.wrapperConnectionId
+      );
+      return null;
+    }
+
+    const deadlines = [state.pingDeadlineAt, state.nextPingAt, state.noOutputDeadlineAt].filter(
+      (deadline): deadline is number => deadline !== undefined
+    );
+    return deadlines.length > 0 ? Math.min(...deadlines) : null;
+  }
+
+  private async checkWrapperLiveness(now: number): Promise<boolean> {
+    logger
+      .withFields({ sessionId: this.sessionId, elapsedMs: Date.now() - now })
+      .debug('Starting checkWrapperLiveness');
+    const state = await getWrapperRuntimeState(this.ctx.storage);
+    const hasLivenessDeadline =
+      state.noOutputDeadlineAt !== undefined ||
+      state.pingDeadlineAt !== undefined ||
+      state.nextPingAt !== undefined;
+    if (!hasLivenessDeadline) return false;
+    if (!state.wrapperConnectionId) return false;
+    const executionId = state.acceptedExecutionId ?? state.wrapperExecutionId;
+    if (!executionId) return false;
+    const execution = await this.executionQueries.get(executionId as ExecutionId);
+    const targetExecutionId = execution?.executionId;
+    const isActive = execution?.status === 'pending' || execution?.status === 'running';
+    if (!isActive) {
+      await clearCurrentWrapperRuntimeLivenessState(
+        this.ctx.storage,
+        state.wrapperGeneration,
+        state.wrapperConnectionId
+      );
+      return false;
+    }
+
+    if (state.noOutputDeadlineAt !== undefined && now >= state.noOutputDeadlineAt) {
+      await this.handleUnhealthyWrapper(
+        state,
+        'Wrapper accepted the message but produced no output',
+        targetExecutionId
+      );
+      return true;
+    }
+
+    if (state.pingDeadlineAt !== undefined && now >= state.pingDeadlineAt) {
+      await this.handleUnhealthyWrapper(
+        state,
+        'Wrapper did not respond to liveness ping',
+        targetExecutionId
+      );
+      return true;
+    }
+
+    if (
+      state.pingDeadlineAt === undefined &&
+      state.nextPingAt !== undefined &&
+      now >= state.nextPingAt
+    ) {
+      if (!targetExecutionId) return false;
+      this.sendToWrapper(targetExecutionId, { type: 'ping' });
+      await markWrapperPingSent(
+        this.ctx.storage,
+        state.wrapperGeneration,
+        state.wrapperConnectionId,
+        now + WRAPPER_PING_TIMEOUT_MS
+      );
+      return true;
+    }
+
+    return false;
+  }
+
+  private async handleUnhealthyWrapper(
+    state: Awaited<ReturnType<typeof getWrapperRuntimeState>>,
+    error: string,
+    fallbackExecutionId?: ExecutionId
+  ): Promise<void> {
+    const executionId =
+      state.acceptedExecutionId ?? state.wrapperExecutionId ?? fallbackExecutionId;
+    if (executionId) {
+      const execution = await this.executionQueries.get(executionId as ExecutionId);
+      if (execution?.status === 'pending' || execution?.status === 'running') {
+        await this.failExecution({
+          executionId: executionId as ExecutionId,
+          status: 'failed',
+          error,
+          streamEventType: 'error',
+        });
+      }
+    }
+
+    if (state.wrapperConnectionId) {
+      await clearCurrentWrapperRuntimeFailureState(
+        this.ctx.storage,
+        state.wrapperGeneration,
+        state.wrapperConnectionId
+      );
+    }
+
+    await this.stopCurrentWrapperProcess();
+  }
+
+  private async stopCurrentWrapperProcess(): Promise<void> {
+    const metadata = await this.getMetadata();
+    if (!metadata) return;
+
+    try {
+      const workerEnv = this.env as unknown as WorkerEnv;
+      const sandboxId =
+        metadata.sandboxId ??
+        (await generateSandboxId(
+          workerEnv.PER_SESSION_SANDBOX_ORG_IDS,
+          metadata.orgId,
+          metadata.userId,
+          metadata.sessionId,
+          metadata.botId
+        ));
+      const sandbox = getSandbox(getSandboxNamespace(workerEnv, sandboxId), sandboxId);
+      await stopWrapper(sandbox, metadata.sessionId);
+    } catch (error) {
+      logger
+        .withFields({
+          sessionId: this.sessionId,
+          error: error instanceof Error ? error.message : String(error),
+        })
+        .warn('Failed to stop unhealthy wrapper process');
+    }
+  }
+
   /**
    * Update execution heartbeat timestamp.
    */
@@ -1940,20 +2227,6 @@ export class CloudAgentSession extends DurableObject {
    */
   async setProcessId(executionId: ExecutionId, processId: string): Promise<boolean> {
     return this.executionQueries.setProcessId(executionId, processId);
-  }
-
-  /**
-   * Set the active execution for this session.
-   */
-  async setActiveExecution(executionId: ExecutionId): Promise<Result<void, SetActiveError>> {
-    return this.executionQueries.setActiveExecution(executionId);
-  }
-
-  /**
-   * Clear the active execution.
-   */
-  async clearActiveExecution(): Promise<void> {
-    return this.executionQueries.clearActiveExecution();
   }
 
   /**
@@ -1984,6 +2257,11 @@ export class CloudAgentSession extends DurableObject {
     error: string;
     streamEventType?: string;
   }): Promise<boolean> {
+    const execution = await this.executionQueries.get(params.executionId as ExecutionId);
+    if (!execution || this.isTerminalStatus(execution.status)) {
+      return false;
+    }
+
     return this.failExecution({
       executionId: params.executionId as ExecutionId,
       status: 'failed',
@@ -2006,11 +2284,12 @@ export class CloudAgentSession extends DurableObject {
     return this.executionQueries.getAll();
   }
 
-  /**
-   * Get the currently active execution ID.
-   */
-  async getActiveExecutionId(): Promise<ExecutionId | null> {
-    return this.executionQueries.getActiveExecutionId();
+  async getCurrentRuntimeExecution(): Promise<ExecutionMetadata | null> {
+    const executionId = await this.getRawWrapperRuntimeExecutionId();
+    if (!executionId) return null;
+
+    const execution = await this.executionQueries.get(executionId);
+    return execution && this.isCurrentRuntimeStatus(execution.status) ? execution : null;
   }
 
   /**
@@ -2100,7 +2379,7 @@ export class CloudAgentSession extends DurableObject {
     variant?: string;
     autoCommit?: boolean;
     condenseOnComplete?: boolean;
-    messageId?: string;
+    messageId: string;
     images?: Images;
     initContext?: InitializeContext;
     resumeContext?: TokenResumeContext;
@@ -2206,24 +2485,105 @@ export class CloudAgentSession extends DurableObject {
     return this.orchestrator;
   }
 
-  private buildStartResult(executionId: ExecutionId): StartExecutionV2Result {
+  private buildStartResult(
+    executionId: ExecutionId,
+    messageId: string,
+    delivery: StartExecutionDelivery = 'sent'
+  ): StartExecutionV2Result {
     return {
       success: true,
       executionId,
       status: 'started',
+      messageId,
+      delivery,
     };
+  }
+
+  private async getPendingQueueCapacityError(): Promise<StartExecutionV2Result | undefined> {
+    const capacity = await checkPendingSessionMessageCapacity(this.ctx.storage);
+    if (capacity.available) return undefined;
+
+    return this.buildStartError(
+      'PENDING_QUEUE_FULL',
+      capacity.message ?? 'Pending message queue is full'
+    );
+  }
+
+  private async schedulePendingMessageFlush(): Promise<void> {
+    await this.scheduleAlarmAtOrBefore(Date.now() + PENDING_FLUSH_DEBOUNCE_MS);
+  }
+
+  // Replays the original ack for a retried messageId that is already queued or accepted by the current wrapper runtime.
+  private async getExistingStartResultForMessageId(
+    messageId: string,
+    fallbackExecutionId: ExecutionId
+  ): Promise<StartExecutionV2Result | undefined> {
+    const existingMessage = await getQueuedMessageByMessageId(this.ctx.storage, messageId);
+    if (existingMessage) {
+      const existingExecutionId = (existingMessage.executionId ??
+        fallbackExecutionId) as ExecutionId;
+      return this.buildStartResult(existingExecutionId, existingMessage.messageId, 'queued');
+    }
+
+    const state = await getWrapperRuntimeState(this.ctx.storage);
+    if (state.acceptedMessageId === messageId && state.acceptedExecutionId) {
+      const acceptedExecution = await this.executionQueries.get(
+        state.acceptedExecutionId as ExecutionId
+      );
+      if (acceptedExecution && this.isCurrentRuntimeStatus(acceptedExecution.status)) {
+        return this.buildStartResult(acceptedExecution.executionId, messageId, 'sent');
+      }
+    }
+
+    if (!state.wrapperExecutionId) return undefined;
+
+    const wrapperExecution = await this.executionQueries.get(
+      state.wrapperExecutionId as ExecutionId
+    );
+    if (wrapperExecution?.messageId !== messageId) return undefined;
+    if (!this.isCurrentRuntimeStatus(wrapperExecution.status)) return undefined;
+
+    return this.buildStartResult(wrapperExecution.executionId, messageId, 'sent');
+  }
+
+  private async queueExecutionPlan(
+    plan: ExecutionPlan,
+    executionKind: PendingSessionExecutionKind
+  ): Promise<StartExecutionV2Result> {
+    const idempotentResult = await this.getExistingStartResultForMessageId(
+      plan.messageId,
+      plan.executionId
+    );
+    if (idempotentResult) return idempotentResult;
+
+    const capacityError = await this.getPendingQueueCapacityError();
+    if (capacityError) return capacityError;
+
+    await enqueuePendingSessionMessage(this.ctx.storage, plan, Date.now(), executionKind);
+    this.insertAndBroadcastEvent({
+      executionId: plan.executionId,
+      sessionId: plan.sessionId,
+      streamEventType: 'message.queued',
+      payload: JSON.stringify({
+        messageId: plan.messageId,
+        executionId: plan.executionId,
+        content: plan.prompt,
+        delivery: 'queued',
+      }),
+      timestamp: Date.now(),
+    });
+    await this.schedulePendingMessageFlush();
+    return this.buildStartResult(plan.executionId, plan.messageId, 'queued');
   }
 
   private buildStartError(
     code: Extract<StartExecutionV2Result, { success: false }>['code'],
-    error: string,
-    activeExecutionId?: ExecutionId
+    error: string
   ): StartExecutionV2Result {
     return {
       success: false,
       code,
       error,
-      activeExecutionId,
     };
   }
 
@@ -2239,14 +2599,14 @@ export class CloudAgentSession extends DurableObject {
   }
 
   /**
-   * Start a V2 execution using direct execution (no queue).
-   * This method performs validation, checks for active execution, and executes directly.
-   *
-   * Returns 409 Conflict (EXECUTION_IN_PROGRESS) if an execution is already active.
+   * Store a V2 execution in the pending queue, then flush asynchronously when the wrapper is available.
    */
   async startExecutionV2(request: StartExecutionV2Request): Promise<StartExecutionV2Result> {
     const sessionId = await this.requireSessionId();
     const executionId = createExecutionId();
+    if (request.messageId !== undefined && !isCanonicalMessageId(request.messageId)) {
+      return this.buildStartError('BAD_REQUEST', MESSAGE_ID_FORMAT_DESCRIPTION);
+    }
 
     // Maps TRPCError codes to StartExecutionV2Result error codes.
     const mapTRPCCodeToResultCode = (
@@ -2263,17 +2623,19 @@ export class CloudAgentSession extends DurableObject {
     };
 
     try {
-      // Check if there's already an active execution - return 409 if so
-      const activeExecutionId = await this.executionQueries.getActiveExecutionId();
-      if (activeExecutionId) {
-        return this.buildStartError(
-          'EXECUTION_IN_PROGRESS',
-          `Execution ${activeExecutionId} is in progress`,
-          activeExecutionId
+      if (request.kind !== 'initiatePrepared') {
+        const idempotentResult = await this.getExistingStartResultForMessageId(
+          request.messageId,
+          executionId
         );
+        if (idempotentResult) return idempotentResult;
       }
 
       if (request.kind === 'initiate') {
+        const { messageId } = request;
+        const capacityError = await this.getPendingQueueCapacityError();
+        if (capacityError) return capacityError;
+
         // Validate githubRepo requires authentication
         if (request.githubRepo && !request.githubToken) {
           return this.buildStartError(
@@ -2316,6 +2678,7 @@ export class CloudAgentSession extends DurableObject {
           mcpServers: request.mcpServers,
           autoCommit: request.autoCommit,
           upstreamBranch: request.upstreamBranch,
+          initialMessageId: messageId,
           sandboxId,
         });
 
@@ -2368,16 +2731,38 @@ export class CloudAgentSession extends DurableObject {
           condenseOnComplete: request.condenseOnComplete,
           initContext,
           kiloSessionId,
+          messageId,
         });
 
-        return await this.executeDirectly(plan);
+        return await this.queueExecutionPlan(plan, 'initiate');
       }
 
       if (request.kind === 'initiatePrepared') {
-        const metadata = await this.getMetadata();
+        let metadata = await this.getMetadata();
         if (!metadata) {
           return this.buildStartError('NOT_FOUND', 'Session not found');
         }
+
+        const messageId = metadata.initialMessageId ?? request.messageId ?? createMessageId();
+        const idempotentResult = await this.getExistingStartResultForMessageId(
+          messageId,
+          executionId
+        );
+        if (idempotentResult) return idempotentResult;
+
+        if (!metadata.initialMessageId) {
+          metadata = {
+            ...metadata,
+            initialMessageId: messageId,
+            version: Date.now(),
+            timestamp: Date.now(),
+          };
+          await this.updateMetadata(metadata);
+        }
+
+        const capacityError = await this.getPendingQueueCapacityError();
+        if (capacityError) return capacityError;
+
         if (!metadata.preparedAt) {
           return this.buildStartError('BAD_REQUEST', 'Session has not been prepared');
         }
@@ -2460,17 +2845,18 @@ export class CloudAgentSession extends DurableObject {
           variant: metadata.variant,
           autoCommit: metadata.autoCommit,
           condenseOnComplete: metadata.condenseOnComplete,
-          messageId: metadata.initialMessageId,
+          messageId,
           images: metadata.images,
           initContext,
           existingMetadata: metadata,
           kiloSessionId: metadata.kiloSessionId,
         });
 
-        return await this.executeDirectly(plan);
+        return await this.queueExecutionPlan(plan, 'initiatePrepared');
       }
 
       // Follow-up message (kind === 'followup')
+      const { messageId } = request;
       const metadata = await this.getMetadata();
       if (!metadata) {
         return this.buildStartError('NOT_FOUND', 'Session not found');
@@ -2479,14 +2865,6 @@ export class CloudAgentSession extends DurableObject {
         return this.buildStartError('BAD_REQUEST', 'Session has not been initiated yet');
       }
 
-      if (request.tokenOverrides?.githubToken && metadata.githubRepo) {
-        await this.updateGithubToken(request.tokenOverrides.githubToken);
-        metadata.githubToken = request.tokenOverrides.githubToken;
-      }
-      if (request.tokenOverrides?.gitToken && metadata.gitUrl) {
-        await this.updateGitToken(request.tokenOverrides.gitToken);
-        metadata.gitToken = request.tokenOverrides.gitToken;
-      }
       const mode = (request.mode ?? metadata.mode ?? 'code') as ExecutionMode;
       const model = normalizeKilocodeModel(request.model ?? metadata.model);
       const variant = request.variant ?? metadata.variant;
@@ -2512,6 +2890,9 @@ export class CloudAgentSession extends DurableObject {
           'GitHub authentication required for this repository'
         );
       }
+
+      const capacityError = await this.getPendingQueueCapacityError();
+      if (capacityError) return capacityError;
 
       const sandboxId =
         metadata.sandboxId ??
@@ -2541,29 +2922,26 @@ export class CloudAgentSession extends DurableObject {
         variant,
         autoCommit: request.autoCommit ?? metadata.autoCommit,
         condenseOnComplete: request.condenseOnComplete ?? metadata.condenseOnComplete,
-        messageId: request.messageId,
+        messageId,
         images: request.images,
         resumeContext,
         existingMetadata: metadata,
         kiloSessionId: metadata.kiloSessionId,
       });
 
-      // Suppress failure callback for followup executions: the caller
-      // (orchestrator) receives the error synchronously via the tRPC
-      // response and has its own fallback logic.  Enqueuing a callback
-      // here would race with the fallback session's callbacks and
-      // corrupt the new review's state (see PLAN-callback-race-fix.md).
-      return await this.executeDirectly(plan, { suppressCallbackOnError: true });
+      const queueResult = await this.queueExecutionPlan(plan, 'followup');
+      if (queueResult.success) {
+        if (request.tokenOverrides?.githubToken && metadata.githubRepo) {
+          await this.updateGithubToken(request.tokenOverrides.githubToken);
+        }
+        if (request.tokenOverrides?.gitToken && metadata.gitUrl) {
+          await this.updateGitToken(request.tokenOverrides.gitToken);
+        }
+      }
+      return queueResult;
     } catch (error) {
       // Handle ExecutionError specifically for proper error code mapping
       if (isExecutionError(error)) {
-        if (error.code === 'EXECUTION_IN_PROGRESS') {
-          return this.buildStartError(
-            'EXECUTION_IN_PROGRESS',
-            error.message,
-            error.activeExecutionId as ExecutionId
-          );
-        }
         // Retryable errors pass through specific code -> 503 in tRPC handler
         if (error.retryable) {
           // error.code is a RetryableErrorCode which matches RetryableResultCode
@@ -2584,14 +2962,224 @@ export class CloudAgentSession extends DurableObject {
     }
   }
 
+  private async flushOnePendingSessionMessage(): Promise<number | undefined> {
+    const now = Date.now();
+    const flushResult = await flushNextPendingSessionMessage({
+      storage: this.ctx.storage,
+      now,
+      hasCurrentRuntimeExecution: async () => Boolean(await this.getCurrentRuntimeExecution()),
+      getMetadataContext: async () => {
+        const metadata = await this.getMetadata();
+        if (!metadata) return null;
+
+        const sandboxId =
+          metadata.sandboxId ??
+          (await generateSandboxId(
+            (this.env as unknown as WorkerEnv).PER_SESSION_SANDBOX_ORG_IDS,
+            metadata.orgId,
+            metadata.userId,
+            metadata.sessionId,
+            metadata.botId
+          ));
+
+        return {
+          sessionId: metadata.sessionId as SessionId,
+          userId: metadata.userId as UserId,
+          orgId: metadata.orgId,
+          sandboxId,
+          kiloSessionId: metadata.kiloSessionId,
+          metadata: {
+            initiatedAt: metadata.initiatedAt,
+            initialMessageId: metadata.initialMessageId,
+            prompt: metadata.prompt,
+            mode: metadata.mode,
+            model: metadata.model,
+            variant: metadata.variant,
+            autoCommit: metadata.autoCommit,
+            condenseOnComplete: metadata.condenseOnComplete,
+            kilocodeToken: metadata.kilocodeToken,
+            githubToken: metadata.githubToken,
+          },
+        };
+      },
+      buildPlan: async ({ message, executionId, executionKind, options, context }) => {
+        const metadata = await this.getMetadata();
+        if (!metadata) {
+          throw new Error('Session metadata is not available');
+        }
+
+        const model = normalizeKilocodeModel(options.model);
+        if (!model) {
+          throw new Error('Session is missing a valid model');
+        }
+
+        if (executionKind !== 'followup') {
+          let githubToken = metadata.githubToken;
+          if (metadata.githubInstallationId) {
+            const appType = metadata.githubAppType || 'standard';
+            githubToken = await this.getGitHubTokenService().getToken(
+              metadata.githubInstallationId,
+              appType
+            );
+          }
+          if (metadata.githubRepo && !githubToken) {
+            throw new Error('GitHub authentication required for this repository');
+          }
+
+          const initContext: InitializeContext = {
+            kilocodeToken: metadata.kilocodeToken ?? '',
+            kilocodeModel: model,
+            githubRepo: metadata.githubRepo,
+            githubToken,
+            gitUrl: metadata.gitUrl,
+            gitToken: metadata.gitToken,
+            envVars: metadata.envVars,
+            encryptedSecrets: metadata.encryptedSecrets,
+            setupCommands: metadata.setupCommands,
+            mcpServers: metadata.mcpServers,
+            upstreamBranch: metadata.upstreamBranch,
+            botId: metadata.botId,
+            kiloSessionId: metadata.kiloSessionId,
+            isPreparedSession: executionKind === 'initiatePrepared',
+            githubAppType: metadata.githubAppType,
+            platform: metadata.platform,
+            createdOnPlatform: metadata.createdOnPlatform,
+          };
+
+          return this.buildExecutionPlan({
+            executionId,
+            sandboxId: context.sandboxId,
+            sessionId: context.sessionId,
+            userId: context.userId,
+            orgId: context.orgId,
+            mode: options.mode ?? 'code',
+            prompt: message.content,
+            model,
+            variant: options.variant,
+            autoCommit: options.autoCommit,
+            condenseOnComplete: options.condenseOnComplete,
+            messageId: message.messageId,
+            initContext,
+            existingMetadata: metadata,
+            kiloSessionId: metadata.kiloSessionId,
+          });
+        }
+
+        return this.buildExecutionPlan({
+          executionId,
+          sandboxId: context.sandboxId,
+          sessionId: context.sessionId,
+          userId: context.userId,
+          orgId: context.orgId,
+          mode: options.mode ?? 'code',
+          prompt: message.content,
+          model,
+          variant: options.variant,
+          autoCommit: options.autoCommit,
+          condenseOnComplete: options.condenseOnComplete,
+          messageId: message.messageId,
+          resumeContext: {
+            kilocodeToken: context.metadata.kilocodeToken ?? '',
+            kilocodeModel: model,
+            githubToken: options.githubTokenOverride ?? context.metadata.githubToken,
+            gitToken: options.gitTokenOverride,
+          },
+          existingMetadata: metadata,
+          kiloSessionId: context.kiloSessionId,
+        });
+      },
+      deliver: async plan => this.executeDirectly(plan, { suppressCallbackOnError: true }),
+      onInferredExecutionKind: (message, executionKind) => {
+        logger
+          .withFields({
+            sessionId: this.sessionId,
+            messageId: message.messageId,
+            executionKind,
+          })
+          .warn('Pending session message missing executionKind; inferred queued intent');
+      },
+    });
+
+    if (flushResult.type === 'skipped') {
+      if (flushResult.nextFlushAttemptAt !== undefined) {
+        return flushResult.nextFlushAttemptAt;
+      }
+
+      const currentRuntimeExecution = await this.getCurrentRuntimeExecution();
+      return currentRuntimeExecution ? now + PENDING_FLUSH_DEBOUNCE_MS : undefined;
+    }
+
+    if (flushResult.type === 'delivered') {
+      return undefined;
+    }
+
+    const metadata = await this.getMetadata();
+    logger
+      .withFields({
+        sessionId: metadata?.sessionId,
+        executionId: flushResult.message.executionId,
+        messageId: flushResult.message.messageId,
+        error: flushResult.message.lastFlushError,
+        attempts: flushResult.attempts,
+        exhausted: flushResult.exhausted,
+        nextFlushAttemptAt: flushResult.nextFlushAttemptAt,
+      })
+      .warn('Failed to flush pending session message');
+    await this.emitPendingMessageFailureIfExhausted(
+      flushResult.message,
+      flushResult.attempts,
+      flushResult.exhausted
+    );
+    return flushResult.nextFlushAttemptAt;
+  }
+
+  private async emitPendingMessageInterrupted(message: PendingSessionMessage): Promise<void> {
+    const sessionId = await this.requireSessionId();
+    const executionId = (message.executionId ?? createExecutionId()) as ExecutionId;
+    this.insertAndBroadcastEvent({
+      executionId,
+      sessionId,
+      streamEventType: 'message.failed',
+      payload: JSON.stringify({
+        messageId: message.messageId,
+        executionId,
+        error: 'Pending queued message interrupted by user',
+        reason: 'interrupted',
+        delivery: 'queued',
+      }),
+      timestamp: Date.now(),
+    });
+  }
+
+  private async emitPendingMessageFailureIfExhausted(
+    message: PendingSessionMessage,
+    attempts: number,
+    exhausted: boolean
+  ): Promise<void> {
+    if (!exhausted) return;
+
+    const sessionId = await this.requireSessionId();
+    const executionId = (message.executionId ?? createExecutionId()) as ExecutionId;
+    this.insertAndBroadcastEvent({
+      executionId,
+      sessionId,
+      streamEventType: 'message.failed',
+      payload: JSON.stringify({
+        messageId: message.messageId,
+        executionId,
+        error: message.lastFlushError ?? 'Pending message delivery failed',
+        attempts,
+      }),
+      timestamp: Date.now(),
+    });
+  }
+
   /**
-   * Execute a plan directly using the orchestrator.
-   * This replaces the queue-based enqueueExecution pattern.
+   * Deliver one pending message through the shared wrapper delivery path.
    *
    * @param suppressCallbackOnError — when true, a pre-start failure (e.g.
-   *   workspace restore) will NOT enqueue a callback notification.  The caller
-   *   is expected to handle the error synchronously (used by the followup path
-   *   where the orchestrator falls back to a fresh session on failure).
+   *   workspace restore) will NOT enqueue a callback notification. The pending
+   *   queue flusher records the failure and schedules a retry when applicable.
    */
   private async executeDirectly(
     plan: ExecutionPlan,
@@ -2599,7 +3187,7 @@ export class CloudAgentSession extends DurableObject {
   ): Promise<StartExecutionV2Result> {
     const { executionId, sessionId, mode } = plan;
 
-    logger.withFields({ sessionId, executionId }).info('executeDirectly called');
+    logger.withFields({ sessionId, executionId }).info('Delivering pending execution to wrapper');
 
     // Add execution metadata to the DO
     const ingestToken = executionId;
@@ -2608,29 +3196,29 @@ export class CloudAgentSession extends DurableObject {
       mode,
       streamingMode: 'websocket',
       ingestToken,
+      messageId: plan.messageId,
     });
 
     if (!addResult.ok) {
       logger
         .withFields({ sessionId, executionId, error: addResult.error })
         .warn('Failed to add execution (may already exist)');
+      return this.buildStartError('INTERNAL', 'Failed to add execution');
     }
 
-    // Set this as the active execution
-    const setActiveResult = await this.executionQueries.setActiveExecution(executionId);
-    if (!setActiveResult.ok) {
-      logger
-        .withFields({ sessionId, executionId, error: setActiveResult.error })
-        .error('Failed to set active execution');
-      return this.buildStartError('INTERNAL', 'Failed to set active execution');
-    }
+    const wrapperRuntimeState = await allocateWrapperRuntimeState(this.ctx.storage, executionId);
+    const fencedPlan = {
+      ...plan,
+      wrapper: {
+        ...plan.wrapper,
+        wrapperGeneration: wrapperRuntimeState.wrapperGeneration,
+        wrapperConnectionId: wrapperRuntimeState.wrapperConnectionId,
+      },
+    } satisfies ExecutionPlan;
 
-    // Reschedule the alarm to the active interval — the idle alarm may be up
-    // to an hour away, but we need the reaper checking every 2 min while an
-    // execution is running (stale detection, hung execution, max runtime, etc.).
-    await this.ctx.storage.setAlarm(Date.now() + REAPER_ACTIVE_INTERVAL_MS);
+    await this.scheduleAlarmAtOrBefore(Date.now() + PENDING_FLUSH_DEBOUNCE_MS);
 
-    // Execute via orchestrator
+    // Deliver via orchestrator
     try {
       const orchestrator = this.getOrCreateOrchestrator();
 
@@ -2655,7 +3243,16 @@ export class CloudAgentSession extends DurableObject {
         });
       };
 
-      const result = await orchestrator.execute(plan, { onProgress: emitProgress });
+      const result = await orchestrator.execute(fencedPlan, { onProgress: emitProgress });
+      const acceptedAt = Date.now();
+      await recordWrapperAcceptedMessage(
+        this.ctx.storage,
+        wrapperRuntimeState,
+        plan.messageId,
+        executionId,
+        acceptedAt + WRAPPER_NO_OUTPUT_TIMEOUT_MS,
+        acceptedAt + WRAPPER_PING_INTERVAL_MS
+      );
 
       // Emit cloud.status = ready after successful execution start
       this.broadcastVolatileEvent({
@@ -2670,7 +3267,7 @@ export class CloudAgentSession extends DurableObject {
         .withFields({ sessionId, executionId, kiloSessionId: result.kiloSessionId })
         .info('Execution started successfully');
 
-      return this.buildStartResult(executionId);
+      return this.buildStartResult(executionId, plan.messageId);
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
 
@@ -2686,27 +3283,26 @@ export class CloudAgentSession extends DurableObject {
         // Best-effort — must not prevent failExecution from running.
       }
 
-      try {
+      await clearWrapperRuntimeIdentityForExecution(
+        this.ctx.storage,
+        executionId,
+        {
+          wrapperGeneration: wrapperRuntimeState.wrapperGeneration,
+          wrapperConnectionId: wrapperRuntimeState.wrapperConnectionId,
+        },
+        { incrementGeneration: true }
+      );
+
+      if (opts?.suppressCallbackOnError) {
+        await this.executionQueries.delete(executionId);
+      } else {
         await this.failExecution({
           executionId,
           status: 'failed',
           error: errorMessage,
           streamEventType: 'error',
-          suppressCallback: opts?.suppressCallbackOnError,
+          suppressCallback: false,
         });
-      } catch (failError) {
-        // failExecution itself threw — force-clear the active execution as a
-        // last-resort safety net so the session is not permanently locked.
-        logger
-          .withFields({ sessionId, executionId, error: String(failError) })
-          .error(
-            'failExecution threw during executeDirectly cleanup — force-clearing active execution'
-          );
-        try {
-          await this.executionQueries.clearActiveExecution();
-        } catch {
-          // Storage write failed — the reaper alarm will catch this.
-        }
       }
 
       throw error;
@@ -2716,8 +3312,8 @@ export class CloudAgentSession extends DurableObject {
   /**
    * Called when an execution completes (successfully, failed, or interrupted).
    *
-   * Updates the execution status and clears the active execution.
-   * With direct execution model, there's no queue to advance.
+   * Updates the execution status and clears the current wrapper runtime execution.
+   * Schedules a pending-message flush if more work is waiting.
    *
    * @param executionId - ID of the completed execution
    * @param status - Final status of the execution
@@ -2731,9 +3327,10 @@ export class CloudAgentSession extends DurableObject {
     const sessionId = await this.resolveSessionId();
     logger.withFields({ sessionId, executionId, status, error }).info('onExecutionComplete called');
 
-    // Snapshot active execution before updateStatus clears it — we need this to
-    // decide whether to clean up the interrupt flag afterward.
-    const wasActive = (await this.executionQueries.getActiveExecutionId()) === executionId;
+    const stateBeforeUpdate = await getWrapperRuntimeState(this.ctx.storage);
+    const wasCurrentRuntimeExecution =
+      stateBeforeUpdate.wrapperExecutionId === executionId ||
+      stateBeforeUpdate.acceptedExecutionId === executionId;
 
     // Update execution status
     const updateResult = await this.updateExecutionStatus({
@@ -2749,16 +3346,17 @@ export class CloudAgentSession extends DurableObject {
         .warn('Failed to update execution status');
     }
 
-    // Clear active execution + interrupt only if this was the active execution.
-    // updateStatus already clears active_execution_id internally when it matches,
-    // so the clear here is a safety net. We skip both clears when this execution
-    // wasn't active to avoid clobbering a newer execution that started in between.
-    if (wasActive) {
-      const activeExecutionId = await this.executionQueries.getActiveExecutionId();
-      if (activeExecutionId === executionId) {
-        await this.executionQueries.clearActiveExecution();
-      }
+    if (wasCurrentRuntimeExecution) {
+      await clearWrapperRuntimeIdentityForExecution(this.ctx.storage, executionId, {
+        wrapperGeneration: stateBeforeUpdate.wrapperGeneration,
+        wrapperConnectionId: stateBeforeUpdate.wrapperConnectionId,
+      });
       await this.executionQueries.clearInterrupt();
+    }
+
+    const pendingCount = await countPendingSessionMessages(this.ctx.storage);
+    if (pendingCount > 0) {
+      await this.schedulePendingMessageFlush();
     }
 
     logger.withFields({ sessionId, executionId }).info('Execution complete - session is idle');

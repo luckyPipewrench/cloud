@@ -6,7 +6,8 @@
  *   autocommit_started, autocommit_completed
  *
  * From DO -> /stream clients:
- *   All of the above, plus wrapper_disconnected, wrapper_reconnected, preparing
+ *   All of the above, plus wrapper_disconnected, wrapper_reconnected, preparing,
+ *   message.queued, message.completed, message.failed
  */
 export type StreamEventType =
   // Wrapper -> DO (execution lifecycle)
@@ -29,6 +30,10 @@ export type StreamEventType =
   | 'preparing' // Async preparation step progress (autoInitiate flow)
   // DO -> /stream clients (cloud infrastructure lifecycle)
   | 'cloud.status' // Cloud infrastructure status (preparing/ready/finalizing/error)
+  // DO -> /stream clients (session message queue)
+  | 'message.queued' // User message accepted into the pending queue
+  | 'message.completed' // Accepted user message completed execution
+  | 'message.failed' // User message delivery failed or was canceled before completion
   | 'connected'; // Sent on WebSocket connect with current service state
 
 /**

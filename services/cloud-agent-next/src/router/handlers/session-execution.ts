@@ -14,6 +14,7 @@ import {
   type QueueAckResponse,
 } from '../schemas.js';
 import type { CloudAgentSession } from '../../persistence/CloudAgentSession.js';
+import { createMessageId } from '../../session/message-id.js';
 
 /** Retryable error codes that should map to 503 */
 const RETRYABLE_CODES: readonly RetryableResultCode[] = [
@@ -30,19 +31,6 @@ function isRetryableCode(code: string): code is RetryableResultCode {
 function throwStartExecutionError(
   result: Extract<StartExecutionV2Result, { success: false }>
 ): never {
-  // Handle EXECUTION_IN_PROGRESS as 409 Conflict with activeExecutionId in body
-  if (result.code === 'EXECUTION_IN_PROGRESS') {
-    throw new TRPCError({
-      code: 'CONFLICT',
-      message: result.error,
-      cause: {
-        error: 'EXECUTION_IN_PROGRESS',
-        message: result.error,
-        activeExecutionId: result.activeExecutionId,
-      },
-    });
-  }
-
   // Handle retryable errors as 503 Service Unavailable with specific error code
   if (isRetryableCode(result.code)) {
     throw new TRPCError({
@@ -61,7 +49,9 @@ function throwStartExecutionError(
       ? 'NOT_FOUND'
       : result.code === 'BAD_REQUEST'
         ? 'BAD_REQUEST'
-        : 'INTERNAL_SERVER_ERROR';
+        : result.code === 'PENDING_QUEUE_FULL'
+          ? 'TOO_MANY_REQUESTS'
+          : 'INTERNAL_SERVER_ERROR';
   throw new TRPCError({
     code,
     message: result.error,
@@ -80,7 +70,7 @@ function getSessionStub(
 
 /**
  * V2 session execution handlers.
- * These use direct execution via the DO's ExecutionOrchestrator.
+ * These ask the DO to store pending delivery and flush through the shared wrapper path.
  */
 export function createSessionExecutionV2Handlers() {
   return {
@@ -89,7 +79,8 @@ export function createSessionExecutionV2Handlers() {
      *
      * Uses a session created via prepareSession (for backend-to-backend flows).
      * The session must be in 'prepared' state (not yet initiated).
-     * Returns 409 Conflict if an execution is already in progress.
+     * Returns an ack with delivery 'queued' after the DO stores pending delivery.
+     * delivery 'sent' is reserved for idempotent replays already accepted by the wrapper.
      */
     initiateFromKilocodeSessionV2: protectedProcedure
       .input(InitiateFromPreparedSessionInput)
@@ -109,11 +100,13 @@ export function createSessionExecutionV2Handlers() {
           const doKey = `${ctx.userId}:${sessionId}`;
           const doId = ctx.env.CLOUD_AGENT_SESSION.idFromName(doKey);
 
+          const messageId = input.messageId ?? createMessageId();
           const startRequest: StartExecutionV2Request = {
             kind: 'initiatePrepared',
             userId: ctx.userId as `user_${string}`,
             botId: ctx.botId,
             authToken: ctx.authToken,
+            messageId,
           };
 
           const startResult = await withDORetry<
@@ -136,6 +129,8 @@ export function createSessionExecutionV2Handlers() {
             cloudAgentSessionId: sessionId,
             status: startResult.status,
             streamUrl: `/stream?cloudAgentSessionId=${sessionId}`,
+            messageId: startResult.messageId,
+            delivery: startResult.delivery,
           };
         });
       }),
@@ -144,7 +139,8 @@ export function createSessionExecutionV2Handlers() {
      * V2: Send a message to an existing session.
      *
      * Sends a follow-up message to an established session.
-     * Returns 409 Conflict if an execution is already in progress.
+     * Returns an ack with delivery 'queued' after the DO stores pending delivery.
+     * delivery 'sent' is reserved for idempotent replays already accepted by the wrapper.
      */
     sendMessageV2: protectedProcedure
       .input(SendMessageV2Input)
@@ -163,6 +159,7 @@ export function createSessionExecutionV2Handlers() {
           const doKey = `${ctx.userId}:${sessionId}`;
           const doId = ctx.env.CLOUD_AGENT_SESSION.idFromName(doKey);
 
+          const messageId = input.messageId ?? createMessageId();
           const startRequest: StartExecutionV2Request = {
             kind: 'followup',
             userId: ctx.userId as `user_${string}`,
@@ -173,7 +170,7 @@ export function createSessionExecutionV2Handlers() {
             variant: input.variant,
             autoCommit: input.autoCommit,
             condenseOnComplete: input.condenseOnComplete,
-            messageId: input.messageId,
+            messageId,
             images: input.images,
             tokenOverrides: {
               githubToken: input.githubToken,
@@ -201,6 +198,8 @@ export function createSessionExecutionV2Handlers() {
             cloudAgentSessionId: sessionId,
             status: startResult.status,
             streamUrl: `/stream?cloudAgentSessionId=${sessionId}`,
+            messageId: startResult.messageId,
+            delivery: startResult.delivery,
           };
         });
       }),

@@ -10,6 +10,7 @@ import {
   ImagesSchema,
 } from '../persistence/schemas.js';
 import { AgentModeSchema, Limits } from '../schema.js';
+import { MESSAGE_ID_FORMAT_DESCRIPTION, MESSAGE_ID_PATTERN } from '../session/message-id.js';
 
 // Re-export schemas from types.ts and persistence/schemas.ts for convenience
 export { sessionIdSchema, githubRepoSchema, gitUrlSchema, envVarsSchema };
@@ -21,6 +22,8 @@ export {
   CallbackTargetSchema,
   ImagesSchema,
 };
+
+export const MessageIdSchema = z.string().regex(MESSAGE_ID_PATTERN, MESSAGE_ID_FORMAT_DESCRIPTION);
 
 // Re-export types
 export type { EncryptedSecretEnvelope, EncryptedSecrets } from '../persistence/schemas.js';
@@ -67,6 +70,7 @@ const requiresAppendSystemPrompt = (data: {
  */
 export const InitiateFromPreparedSessionInput = z.object({
   cloudAgentSessionId: sessionIdSchema.describe('Cloud-agent session ID from prepareSession'),
+  messageId: MessageIdSchema.optional().describe('Optional initial message ID for idempotency'),
 });
 
 /**
@@ -101,12 +105,9 @@ export const SendMessageV2Input = z
     images: ImagesSchema.optional().describe(
       'Optional image attachments to download from R2 to the sandbox'
     ),
-    messageId: z
-      .string()
-      .startsWith('msg_')
-      .length(30)
-      .optional()
-      .describe('Optional message ID for correlating the request'),
+    messageId: MessageIdSchema.nullish().describe(
+      'Optional message ID for correlating the request'
+    ),
   })
   .extend(PromptPayload.shape)
   .refine(rejectCustomMode, {
@@ -226,12 +227,9 @@ export const PrepareSessionInput = z
       .describe(
         'When true, return immediately after creating IDs and run preparation asynchronously. Progress events are streamed via WebSocket.'
       ),
-    initialMessageId: z
-      .string()
-      .startsWith('msg_')
-      .length(30)
-      .optional()
-      .describe('Initial message ID for correlation with external systems'),
+    initialMessageId: MessageIdSchema.optional().describe(
+      'Initial message ID for correlation with external systems'
+    ),
   })
   .refine(validateGitSource, {
     message: 'Must provide either githubRepo or gitUrl, but not both',
@@ -338,7 +336,7 @@ export const GetSessionInput = z.object({
  */
 export const ExecutionStatusSchema = z
   .object({
-    id: z.string().describe('Execution ID currently running'),
+    id: z.string().describe('Execution ID for the current pending or running runtime execution'),
     status: z
       .enum(['pending', 'running', 'completed', 'failed', 'interrupted'])
       .describe('Current status of the execution'),
@@ -354,7 +352,7 @@ export const ExecutionStatusSchema = z
       .describe('Health status: healthy (<1min heartbeat), unknown (1-10min), stale (>10min)'),
   })
   .nullable()
-  .describe('Current execution status (null if no active execution)');
+  .describe('Current runtime execution status (null if none)');
 
 export const GetSessionOutput = z.object({
   // Session identifiers
@@ -398,7 +396,7 @@ export const GetSessionOutput = z.object({
   ),
 
   // Initial message ID for correlation
-  initialMessageId: z.string().startsWith('msg_').length(30).optional(),
+  initialMessageId: MessageIdSchema.optional(),
 
   // Versioning
   timestamp: z.number().describe('Last update timestamp'),
@@ -409,14 +407,16 @@ export type GetSessionResponse = z.infer<typeof GetSessionOutput>;
 
 /**
  * Response schema for V2 execution endpoints.
- * Returns acknowledgment when execution has started.
- * Returns 409 Conflict if an execution is already in progress.
+ * Returns acknowledgment when the message is accepted for immediate wrapper delivery
+ * or queued for later delivery.
  */
 export const ExecutionResponse = z.object({
   cloudAgentSessionId: z.string().describe('Cloud agent session ID'),
   executionId: z.string().describe('Execution ID for streaming and ingest'),
   status: z.literal('started').describe('Execution has started'),
   streamUrl: z.string().describe('WebSocket URL for streaming output'),
+  messageId: MessageIdSchema.describe('Message ID accepted by delivery'),
+  delivery: z.enum(['sent', 'queued']).describe('How the message was accepted for delivery'),
 });
 export type ExecutionResponse = z.infer<typeof ExecutionResponse>;
 
@@ -425,16 +425,6 @@ export type ExecutionResponse = z.infer<typeof ExecutionResponse>;
  */
 export const QueueAckResponse = ExecutionResponse;
 export type QueueAckResponse = ExecutionResponse;
-
-/**
- * Error response for 409 Conflict when execution is already in progress.
- */
-export const ConflictErrorResponse = z.object({
-  error: z.literal('EXECUTION_IN_PROGRESS').describe('Error code'),
-  message: z.string().describe('Human-readable error message'),
-  activeExecutionId: z.string().describe('The currently active execution ID'),
-});
-export type ConflictErrorResponse = z.infer<typeof ConflictErrorResponse>;
 
 /**
  * Error response for 503 Service Unavailable when transient failures occur.

@@ -57,6 +57,9 @@ import type { CloudAgentSessionState } from './persistence/types.js';
 type MockSessionStub = {
   deleteSession: ReturnType<typeof vi.fn>;
   markAsInterrupted: ReturnType<typeof vi.fn>;
+  interruptExecution?: ReturnType<typeof vi.fn>;
+  getCurrentRuntimeExecution?: ReturnType<typeof vi.fn>;
+  getMetadata?: ReturnType<typeof vi.fn>;
 };
 
 type MockCAS = {
@@ -294,8 +297,7 @@ describe('router sessionId validation', () => {
                 get: vi.fn(() => ({
                   deleteSession: vi.fn().mockResolvedValue(undefined),
                   markAsInterrupted: vi.fn().mockResolvedValue(undefined),
-                  getActiveExecutionId: vi.fn().mockResolvedValue(null),
-                  getExecution: vi.fn().mockResolvedValue(null),
+                  getCurrentRuntimeExecution: vi.fn().mockResolvedValue(null),
                 })),
               } as unknown as TRPCContext['env']['CLOUD_AGENT_SESSION'],
               SESSION_INGEST: {
@@ -640,6 +642,120 @@ describe('router sessionId validation', () => {
       });
     });
 
+    describe('interruptSession procedure', () => {
+      let mockContext: TRPCContext;
+      let caller: ReturnType<typeof appRouter.createCaller>;
+      let cloudAgentSession: MockCAS;
+      let mockSessionStub: MockSessionStub;
+      let mockSandbox: ReturnType<typeof getSandbox>;
+
+      beforeEach(() => {
+        vi.clearAllMocks();
+        interruptMock.mockResolvedValue({
+          success: true,
+          message: 'Interrupted execution using pkill',
+          processesFound: true,
+        });
+        buildContextMock.mockImplementation(
+          ({
+            sandboxId,
+            orgId,
+            userId,
+            sessionId,
+          }: {
+            sandboxId: string;
+            orgId: string | undefined;
+            userId: string;
+            sessionId: string;
+          }) => ({
+            sandboxId,
+            orgId,
+            userId,
+            sessionId,
+            sessionHome: `/home/${sessionId}`,
+            workspacePath: `/workspace/${sessionId}`,
+            branchName: `session/${sessionId}`,
+          })
+        );
+        getOrCreateSessionMock.mockResolvedValue({ token: 'session' });
+
+        mockSessionStub = {
+          deleteSession: vi.fn().mockResolvedValue(undefined),
+          markAsInterrupted: vi.fn().mockResolvedValue(undefined),
+          interruptExecution: vi.fn().mockResolvedValue({
+            success: true,
+            executionId: 'exc_interrupt_runtime',
+          }),
+          getCurrentRuntimeExecution: vi.fn().mockResolvedValue(null),
+          getMetadata: vi.fn().mockResolvedValue(null),
+        };
+
+        mockContext = {
+          userId: 'test-user-123',
+          authToken: 'test-token',
+          botId: undefined,
+          request: {} as Request,
+          env: {
+            Sandbox: {} as TRPCContext['env']['Sandbox'],
+            SandboxSmall: {} as TRPCContext['env']['SandboxSmall'],
+            CLOUD_AGENT_SESSION: {
+              idFromName: vi.fn((id: string) => ({ id })),
+              get: vi.fn(() => mockSessionStub),
+            } as unknown as TRPCContext['env']['CLOUD_AGENT_SESSION'],
+            SESSION_INGEST: {
+              fetch: vi.fn(),
+            } as unknown as TRPCContext['env']['SESSION_INGEST'],
+            R2_BUCKET: {} as TRPCContext['env']['R2_BUCKET'],
+            NEXTAUTH_SECRET: 'test-secret',
+            INTERNAL_API_SECRET_PROD: {
+              get: vi.fn().mockResolvedValue('test-secret'),
+            } as unknown as TRPCContext['env']['INTERNAL_API_SECRET_PROD'],
+          },
+        };
+        cloudAgentSession = mockContext.env.CLOUD_AGENT_SESSION as unknown as MockCAS;
+
+        mockSandbox = {} as ReturnType<typeof getSandbox>;
+        vi.mocked(getSandbox).mockReturnValue(mockSandbox);
+
+        vi.stubGlobal('scheduler', {
+          wait: vi.fn().mockResolvedValue(undefined),
+        });
+
+        caller = appRouter.createCaller(mockContext);
+      });
+
+      it('short-circuits queued-only interrupts before creating a sandbox session', async () => {
+        const sessionId: SessionId = 'agent_12345678-1234-1234-1234-123456789abc';
+        const metadata: CloudAgentSessionState = {
+          version: 123456789,
+          sessionId,
+          orgId: 'org-123',
+          userId: 'test-user-123',
+          timestamp: 123456789,
+        };
+
+        vi.mocked(fetchSessionMetadata).mockResolvedValue(metadata);
+        mockSessionStub.interruptExecution = vi.fn().mockResolvedValue({
+          success: true,
+          executionId: undefined,
+        });
+
+        const result = await caller.interruptSession({ sessionId });
+
+        expect(result).toEqual({
+          success: true,
+          message: 'Queued session messages interrupted',
+          processesFound: false,
+        });
+        expect(mockSessionStub.markAsInterrupted).toHaveBeenCalled();
+        expect(mockSessionStub.interruptExecution).toHaveBeenCalled();
+        expect(getOrCreateSessionMock).not.toHaveBeenCalled();
+        expect(interruptMock).not.toHaveBeenCalled();
+        expect(getSandbox).not.toHaveBeenCalled();
+        expect(cloudAgentSession.idFromName).toHaveBeenCalledWith(`test-user-123:${sessionId}`);
+      });
+    });
+
     describe('getSession procedure', () => {
       let mockContext: TRPCContext;
       let caller: ReturnType<typeof appRouter.createCaller>;
@@ -664,8 +780,7 @@ describe('router sessionId validation', () => {
               idFromName: vi.fn((id: string) => ({ id })),
               get: vi.fn(() => ({
                 getMetadata: mockGetMetadata,
-                getActiveExecutionId: vi.fn().mockResolvedValue(null),
-                getExecution: vi.fn().mockResolvedValue(null),
+                getCurrentRuntimeExecution: vi.fn().mockResolvedValue(null),
               })),
             } as unknown as TRPCContext['env']['CLOUD_AGENT_SESSION'],
             SESSION_INGEST: {

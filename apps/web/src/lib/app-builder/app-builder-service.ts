@@ -430,6 +430,8 @@ async function createV2Session(params: CreateSessionParams): Promise<InitiateSes
     executionId: result.executionId,
     status: result.status,
     streamUrl: result.streamUrl,
+    messageId: result.messageId,
+    delivery: result.delivery,
   };
 }
 
@@ -503,6 +505,8 @@ async function sendToExistingV2Session(
     executionId: result.executionId,
     status: result.status,
     streamUrl: result.streamUrl,
+    messageId: result.messageId,
+    delivery: result.delivery,
   };
 }
 

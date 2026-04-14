@@ -41,6 +41,7 @@ import {
 import { generateImageUploadUrl } from '@/lib/r2/cloud-agent-attachments';
 import * as z from 'zod';
 import { PLATFORM } from '@/lib/integrations/core/constants';
+import { generateMessageId } from '@/lib/cloud-agent-sdk/message-id';
 
 // Extend base schemas with organizationId for organization context
 const PrepareSessionInput = basePrepareSessionNextSchema.and(
@@ -206,6 +207,7 @@ export const organizationCloudAgentNextRouter = createTRPCRouter({
         return await client.initiateFromPreparedSession({
           cloudAgentSessionId: input.cloudAgentSessionId,
           kilocodeOrganizationId: input.organizationId,
+          messageId: input.messageId,
         });
       } catch (error) {
         rethrowAsPaymentRequired(error);
@@ -248,6 +250,7 @@ export const organizationCloudAgentNextRouter = createTRPCRouter({
       try {
         return await client.sendMessage({
           ...messageInput,
+          messageId: messageInput.messageId ?? generateMessageId(),
           githubToken,
           gitToken,
         });

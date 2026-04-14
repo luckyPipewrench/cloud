@@ -21,7 +21,6 @@ import {
   ExecutionError,
   isExecutionError,
   type RetryableErrorCode,
-  type ConflictErrorCode,
   type PermanentErrorCode,
 } from '../../../src/execution/errors.js';
 import type {
@@ -122,21 +121,6 @@ describe('ExecutionError', () => {
   });
 
   // -------------------------------------------------------------------------
-  // Factory Methods - Conflict Errors
-  // -------------------------------------------------------------------------
-
-  describe('conflict error factory methods', () => {
-    it('executionInProgress creates conflict error', () => {
-      const error = ExecutionError.executionInProgress('exc_active');
-
-      expect(error.code).toBe('EXECUTION_IN_PROGRESS');
-      expect(error.retryable).toBe(false);
-      expect(error.activeExecutionId).toBe('exc_active');
-      expect(error.message).toContain('exc_active');
-    });
-  });
-
-  // -------------------------------------------------------------------------
   // Factory Methods - Permanent Errors
   // -------------------------------------------------------------------------
 
@@ -213,11 +197,6 @@ describe('ExecutionError', () => {
       }
 
       expect(error.retryable).toBe(true);
-    });
-
-    it('EXECUTION_IN_PROGRESS is not retryable', () => {
-      const error = ExecutionError.executionInProgress('exc_123');
-      expect(error.retryable).toBe(false);
     });
 
     it('INVALID_REQUEST is not retryable', () => {

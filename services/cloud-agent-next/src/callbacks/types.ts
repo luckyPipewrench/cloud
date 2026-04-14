@@ -7,6 +7,8 @@ export type ExecutionCallbackPayload = {
   sessionId: string;
   cloudAgentSessionId: string;
   executionId: string;
+  /** Message ID correlated with this execution, when available. */
+  messageId?: string;
   status: 'completed' | 'failed' | 'interrupted';
   errorMessage?: string;
   lastSeenBranch?: string;

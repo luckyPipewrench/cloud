@@ -35,7 +35,7 @@ export type WrapperKiloClient = {
   getSession: (sessionId: string) => Promise<{ id: string }>;
   sendPromptAsync: (opts: {
     sessionId: string;
-    messageId?: string;
+    messageId: string;
     parts?: Array<
       | { type: 'text'; text: string }
       | { type: 'file'; mime: string; url: string; filename?: string }

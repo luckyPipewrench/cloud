@@ -1,10 +1,9 @@
 /**
  * Types for the cloud-agent execution system.
  *
- * This module defines the core types for direct execution without queuing.
+ * This module defines the core types for queue-first acceptance and wrapper delivery.
  *
- * NOTE: Queue-specific types (ExecutionMessage, WrapperLaunchPlan) have been removed
- * as part of the migration to direct execution.
+ * NOTE: Legacy worker-queue types (ExecutionMessage, WrapperLaunchPlan) have been removed.
  */
 
 import type { ExecutionId, SessionId, UserId } from '../types/ids.js';
@@ -130,6 +129,7 @@ type InitiateExecutionRequest = BaseExecutionRequest & {
   /** Git platform type for correct token/env var handling */
   platform?: 'github' | 'gitlab';
   createdOnPlatform?: string;
+  messageId: string;
 };
 
 /**
@@ -152,7 +152,7 @@ type FollowupExecutionRequest = BaseExecutionRequest & {
   variant?: string;
   autoCommit?: boolean;
   condenseOnComplete?: boolean;
-  messageId?: string;
+  messageId: string;
   images?: Images;
   tokenOverrides?: {
     githubToken?: string;
@@ -179,11 +179,16 @@ export type RetryableResultCode =
   | 'WRAPPER_START_FAILED';
 
 /**
+ * Delivery mode for an accepted V2 start request.
+ * - sent: the wrapper accepted the message synchronously with HTTP 200.
+ * - queued: the DO accepted and stored the message for later delivery.
+ */
+export type StartExecutionDelivery = 'sent' | 'queued';
+
+/**
  * Result of starting a V2 execution.
- * Returns 409 Conflict if an execution is already in progress.
  *
  * Error codes:
- * - EXECUTION_IN_PROGRESS: 409 Conflict (another execution is running)
  * - SANDBOX_CONNECT_FAILED, WORKSPACE_SETUP_FAILED, KILO_SERVER_FAILED, WRAPPER_START_FAILED: 503 Service Unavailable
  * - NOT_FOUND: 404 Not Found
  * - BAD_REQUEST: 400 Bad Request
@@ -194,18 +199,13 @@ export type StartExecutionV2Result =
       success: true;
       executionId: ExecutionId;
       status: 'started';
+      messageId: string;
+      delivery: StartExecutionDelivery;
     }
   | {
       success: false;
-      code:
-        | 'NOT_FOUND'
-        | 'BAD_REQUEST'
-        | 'INTERNAL'
-        | 'EXECUTION_IN_PROGRESS'
-        | RetryableResultCode;
+      code: 'NOT_FOUND' | 'BAD_REQUEST' | 'INTERNAL' | 'PENDING_QUEUE_FULL' | RetryableResultCode;
       error: string;
-      /** For EXECUTION_IN_PROGRESS, the currently active execution ID */
-      activeExecutionId?: ExecutionId;
     };
 
 // ---------------------------------------------------------------------------
@@ -316,6 +316,8 @@ export type WrapperPlan = {
   variant?: string;
   autoCommit?: boolean;
   condenseOnComplete?: boolean;
+  wrapperGeneration?: number;
+  wrapperConnectionId?: string;
 };
 
 // ---------------------------------------------------------------------------
@@ -345,8 +347,8 @@ export type ExecutionPlan = {
   wrapper: WrapperPlan;
   /** Optional image attachments */
   images?: Images;
-  /** Optional message ID for correlating the request */
-  messageId?: string;
+  /** Message ID for correlating the request */
+  messageId: string;
 };
 
 // ---------------------------------------------------------------------------

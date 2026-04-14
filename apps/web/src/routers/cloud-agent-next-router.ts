@@ -37,6 +37,7 @@ import {
 import { generateImageUploadUrl } from '@/lib/r2/cloud-agent-attachments';
 import * as z from 'zod';
 import { PLATFORM } from '@/lib/integrations/core/constants';
+import { generateMessageId } from '@/lib/cloud-agent-sdk/message-id';
 
 /**
  * Cloud Agent Next Router (Personal Context)
@@ -143,6 +144,7 @@ export const cloudAgentNextRouter = createTRPCRouter({
       try {
         return await client.initiateFromPreparedSession({
           cloudAgentSessionId: input.cloudAgentSessionId,
+          messageId: input.messageId,
         });
       } catch (error) {
         rethrowAsPaymentRequired(error);
@@ -183,6 +185,7 @@ export const cloudAgentNextRouter = createTRPCRouter({
       try {
         return await client.sendMessage({
           ...input,
+          messageId: input.messageId ?? generateMessageId(),
           githubToken,
           gitToken,
         });

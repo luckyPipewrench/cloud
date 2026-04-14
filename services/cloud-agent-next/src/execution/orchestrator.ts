@@ -175,6 +175,8 @@ export class ExecutionOrchestrator {
       ingestToken,
       workerAuthToken: kilocodeToken,
       upstreamBranch: prepared.context.upstreamBranch,
+      wrapperGeneration: wrapper.wrapperGeneration,
+      wrapperConnectionId: wrapper.wrapperConnectionId,
     };
 
     // Normalize mode to internal mode (e.g., 'architect' -> 'plan', 'orchestrator' -> 'code')

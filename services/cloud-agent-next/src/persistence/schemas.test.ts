@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest';
-import { ImagesSchema, MCPServerConfigSchema, MetadataSchema } from './schemas.js';
+import {
+  ImagesSchema,
+  MCPServerConfigSchema,
+  MetadataSchema,
+  PreparationInputSchema,
+} from './schemas.js';
 import type { MCPServerConfig } from './types.js';
 
 describe('ImagesSchema', () => {
@@ -280,6 +285,36 @@ describe('MCPServerConfigSchema', () => {
       const result = MCPServerConfigSchema.parse(config);
       expect(result).toEqual({ type: 'local', command: ['node'] });
     });
+  });
+});
+
+describe('PreparationInputSchema', () => {
+  const baseInput = {
+    sessionId: 'agent_schema_preparation',
+    userId: 'user_schema_preparation',
+    authToken: 'token',
+    prompt: 'prepare this',
+    mode: 'code',
+    model: 'test-model',
+  };
+
+  it('rejects auto-initiate without initialMessageId', () => {
+    const result = PreparationInputSchema.safeParse({
+      ...baseInput,
+      autoInitiate: true,
+    });
+
+    expect(result.success).toBe(false);
+  });
+
+  it('accepts auto-initiate with initialMessageId', () => {
+    const result = PreparationInputSchema.safeParse({
+      ...baseInput,
+      autoInitiate: true,
+      initialMessageId: 'msg_018f1e2d3c4bPrepInitMsgXXX',
+    });
+
+    expect(result.success).toBe(true);
   });
 });
 

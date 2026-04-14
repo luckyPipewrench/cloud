@@ -256,6 +256,12 @@ export function createConnectionManager(
 
     const url = new URL(job.ingestUrl);
     url.searchParams.set('executionId', job.executionId);
+    if (job.wrapperGeneration !== undefined) {
+      url.searchParams.set('wrapperGeneration', String(job.wrapperGeneration));
+    }
+    if (job.wrapperConnectionId) {
+      url.searchParams.set('wrapperConnectionId', job.wrapperConnectionId);
+    }
 
     const wsUrl = url.toString();
     logToFile(`ingest WS connecting to: ${wsUrl}`);

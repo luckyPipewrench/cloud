@@ -224,7 +224,7 @@ describe('WrapperClient', () => {
       );
       const client = new WrapperClient({ session, port: defaultPort });
 
-      const result = await client.prompt({ prompt: 'Hello, world!' });
+      const result = await client.prompt({ prompt: 'Hello, world!', messageId: 'msg_test_1' });
 
       expect(result.messageId).toBe('msg_generated_1');
     });
@@ -233,7 +233,10 @@ describe('WrapperClient', () => {
       const session = createMockSession(createSuccessResponse({ status: 'sent' }));
       const client = new WrapperClient({ session, port: defaultPort });
 
-      const result = await client.prompt({ prompt: 'Hello, world!' });
+      const result = await client.prompt({
+        prompt: 'Hello, world!',
+        messageId: 'msg_test_1',
+      });
 
       expect(result.messageId).toBeUndefined();
     });
@@ -244,32 +247,42 @@ describe('WrapperClient', () => {
       );
       const client = new WrapperClient({ session, port: defaultPort });
 
-      await client.prompt({ prompt: 'Test prompt' });
+      await client.prompt({ prompt: 'Test prompt', messageId: 'msg_test_2' });
 
       const execCall = (session.exec as ReturnType<typeof vi.fn>).mock.calls[0][0] as string;
       expect(execCall).toContain('/job/prompt');
       expect(execCall).toContain('Test prompt');
     });
 
-    it('sends all options', async () => {
-      const session = createMockSession(
-        createSuccessResponse({ status: 'sent', messageId: 'msg_custom' })
-      );
+    it('sends all options with the exact provided messageId', async () => {
+      const messageId = 'msg_018f1e2d3c4bAbCdEfGhIjKlMn';
+      const session = createMockSession(createSuccessResponse({ status: 'sent', messageId }));
       const client = new WrapperClient({ session, port: defaultPort });
 
       const options: WrapperPromptOptions = {
         prompt: 'Complex prompt',
         model: { providerID: 'kilo', modelID: 'anthropic/claude-sonnet-4-20250514' },
         agent: 'code',
-        messageId: 'msg_custom',
+        messageId,
         system: 'You are a helpful assistant',
         tools: { read_file: true, write_file: false },
+        execution: {
+          executionId: 'exc_test',
+          ingestUrl: 'wss://example.com/ingest',
+          ingestToken: 'exc_test',
+          workerAuthToken: 'token',
+          wrapperGeneration: 3,
+          wrapperConnectionId: 'conn_abc',
+        },
       };
 
       await client.prompt(options);
 
       const execCall = (session.exec as ReturnType<typeof vi.fn>).mock.calls[0][0] as string;
       expect(execCall).toContain('/job/prompt');
+      expect(execCall).toContain(`"messageId":"${messageId}"`);
+      expect(execCall).toContain('"wrapperGeneration":3');
+      expect(execCall).toContain('"wrapperConnectionId":"conn_abc"');
     });
 
     it('includes variant in request body when provided', async () => {
@@ -281,6 +294,7 @@ describe('WrapperClient', () => {
       await client.prompt({
         prompt: 'Test with variant',
         variant: 'high',
+        messageId: 'msg_test_variant',
       });
 
       const execCall = (session.exec as ReturnType<typeof vi.fn>).mock.calls[0][0] as string;
@@ -294,6 +308,7 @@ describe('WrapperClient', () => {
       const client = new WrapperClient({ session, port: defaultPort });
 
       await client.prompt({
+        messageId: 'msg_test_files',
         parts: [
           { type: 'text', text: 'Describe these images' },
           {
@@ -321,7 +336,9 @@ describe('WrapperClient', () => {
       const session = createMockSession(createErrorResponse('NO_JOB', 'Call /job/start first'));
       const client = new WrapperClient({ session, port: defaultPort });
 
-      await expect(client.prompt({ prompt: 'test' })).rejects.toThrow(WrapperNoJobError);
+      await expect(client.prompt({ prompt: 'test', messageId: 'msg_test_3' })).rejects.toThrow(
+        WrapperNoJobError
+      );
     });
   });
 
@@ -1185,7 +1202,7 @@ describe('WrapperClient', () => {
       );
       const client = new WrapperClient({ session, port: defaultPort });
 
-      await client.prompt({ prompt: "It's a test with 'quotes'" });
+      await client.prompt({ prompt: "It's a test with 'quotes'", messageId: 'msg_test_quotes' });
 
       const execCall = (session.exec as ReturnType<typeof vi.fn>).mock.calls[0][0] as string;
       // Single quotes should be escaped for shell
@@ -1210,7 +1227,7 @@ describe('WrapperClient', () => {
       );
       const client = new WrapperClient({ session, port: defaultPort });
 
-      await client.prompt({ prompt: 'test' });
+      await client.prompt({ prompt: 'test', messageId: 'msg_test_3' });
 
       const execCall = (session.exec as ReturnType<typeof vi.fn>).mock.calls[0][0] as string;
       expect(execCall).toContain('-X POST');

@@ -29,6 +29,8 @@ export type ExecutionBinding = {
   ingestToken: string;
   workerAuthToken: string;
   upstreamBranch?: string;
+  wrapperGeneration?: number;
+  wrapperConnectionId?: string;
 };
 
 export type EnsureRunningOptions = {
@@ -55,7 +57,7 @@ export type WrapperPromptOptions = {
   model?: { providerID?: string; modelID: string };
   variant?: string;
   agent?: string;
-  messageId?: string;
+  messageId: string;
   system?: string;
   tools?: Record<string, boolean>;
   autoCommit?: boolean;

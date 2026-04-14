@@ -160,6 +160,25 @@ describe('deliverCallbackJob', () => {
       );
     });
 
+    it('should preserve executionId and include optional messageId in request payload', async () => {
+      const mockFetch = vi.fn().mockResolvedValue(new Response('', { status: 200 }));
+      globalThis.fetch = mockFetch;
+      const target: CallbackTarget = { url: 'https://example.com/callback' };
+      const payload: ExecutionCallbackPayload = {
+        ...mockPayload,
+        messageId: 'msg_018f1e2d3c4bCallbackMsgId',
+      };
+
+      await deliverCallbackJob(target, payload, 1);
+
+      expect(mockFetch).toHaveBeenCalledWith(
+        'https://example.com/callback',
+        expect.objectContaining({
+          body: JSON.stringify(payload),
+        })
+      );
+    });
+
     it('should include custom headers in request', async () => {
       const mockFetch = vi.fn().mockResolvedValue(new Response('', { status: 200 }));
       globalThis.fetch = mockFetch;

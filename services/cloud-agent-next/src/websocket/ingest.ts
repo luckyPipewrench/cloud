@@ -58,6 +58,8 @@ const errorEventSchema = z.object({
   message: z.string().optional(),
 });
 
+const wrapperGenerationParamSchema = z.coerce.number().int().nonnegative();
+
 // ---------------------------------------------------------------------------
 // Persistence Allowlists
 // ---------------------------------------------------------------------------
@@ -100,8 +102,6 @@ const createExecutionLifecycleContext = (doContext: IngestDOContext) => ({
     err?: string,
     gateResult?: 'pass' | 'fail'
   ) => doContext.updateExecutionStatus(id, status, err, gateResult),
-  clearActiveExecution: () => doContext.clearActiveExecution(),
-  getActiveExecutionId: () => doContext.getActiveExecutionId(),
   logger: console,
 });
 
@@ -131,6 +131,10 @@ export type IngestAttachment = {
   lastHeartbeatUpdate: number;
   /** Last lastEventAt update timestamp for debouncing */
   lastEventAtUpdate: number;
+  /** Wrapper generation fencing value, when provided by wrapper */
+  wrapperGeneration?: number;
+  /** Wrapper connection fencing ID, when provided by wrapper */
+  wrapperConnectionId?: string;
 };
 
 // ---------------------------------------------------------------------------
@@ -153,10 +157,6 @@ export type IngestDOContext = {
   updateKiloSessionId: (id: string) => Promise<void>;
   /** Persist the upstream branch in DO metadata */
   updateUpstreamBranch: (branch: string) => Promise<void>;
-  /** Clear the active execution when done */
-  clearActiveExecution: () => Promise<void>;
-  /** Get the currently active execution ID (if any) */
-  getActiveExecutionId: () => Promise<string | null>;
   /** Get execution data for validation (including ingestToken) */
   getExecution: (executionId: string) => Promise<ExecutionData | null>;
   /** Transition execution status to 'running' when wrapper connects */
@@ -173,7 +173,27 @@ export type IngestDOContext = {
     gateResult?: 'pass' | 'fail'
   ) => Promise<void>;
   /** Cancel the disconnect grace period when wrapper reconnects */
-  cancelDisconnectGrace?: () => Promise<void>;
+  cancelDisconnectGrace?: (
+    wrapperGeneration?: number,
+    wrapperConnectionId?: string
+  ) => Promise<void>;
+  /** Validate wrapper generation/connection fencing against durable runtime state */
+  isCurrentWrapperConnection?: (
+    wrapperGeneration: number,
+    wrapperConnectionId: string
+  ) => Promise<boolean>;
+  /** Persist pong liveness from the current wrapper connection */
+  recordWrapperPong?: (
+    wrapperGeneration: number,
+    wrapperConnectionId: string,
+    now: number
+  ) => Promise<void>;
+  /** Persist meaningful output from the current wrapper connection */
+  recordMeaningfulWrapperOutput?: (
+    wrapperGeneration: number,
+    wrapperConnectionId: string,
+    now: number
+  ) => Promise<void>;
 };
 
 // ---------------------------------------------------------------------------
@@ -227,6 +247,11 @@ export function createIngestHandler(
 
       const url = new URL(request.url);
       const executionId = url.searchParams.get('executionId') as ExecutionId | null;
+      const wrapperGenerationParam = url.searchParams.get('wrapperGeneration');
+      const wrapperConnectionId = url.searchParams.get('wrapperConnectionId') ?? undefined;
+      const parsedWrapperGeneration = wrapperGenerationParam
+        ? wrapperGenerationParamSchema.safeParse(wrapperGenerationParam)
+        : undefined;
 
       if (!executionId) {
         return new Response('Missing executionId parameter', { status: 400 });
@@ -242,16 +267,51 @@ export function createIngestHandler(
         return new Response('Invalid executionId', { status: 401 });
       }
 
+      if (wrapperGenerationParam && !parsedWrapperGeneration?.success) {
+        return new Response('Invalid wrapperGeneration parameter', { status: 400 });
+      }
+
+      if (parsedWrapperGeneration?.success && !wrapperConnectionId) {
+        return new Response('Missing wrapperConnectionId parameter', { status: 400 });
+      }
+
+      if (wrapperConnectionId && !parsedWrapperGeneration?.success) {
+        return new Response('Missing wrapperGeneration parameter', { status: 400 });
+      }
+
+      const wrapperGeneration = parsedWrapperGeneration?.success
+        ? parsedWrapperGeneration.data
+        : undefined;
+
+      if (wrapperGeneration !== undefined && wrapperConnectionId) {
+        const isCurrent = await doContext.isCurrentWrapperConnection?.(
+          wrapperGeneration,
+          wrapperConnectionId
+        );
+        if (!isCurrent) {
+          return new Response('Stale wrapper connection', { status: 409 });
+        }
+      }
+
       // Allow connections only for pending or running executions
       if (execution.status !== 'pending' && execution.status !== 'running') {
         return new Response('Execution not active', { status: 409 });
       }
 
-      // Close any existing ingest sockets for this execution (including
-      // hibernated ones that wouldn't appear in an in-memory map).
-      // state.getWebSockets() is the authoritative source — it survives
-      // hibernation and excludes already-disconnected sockets.
+      // Close duplicate sockets for this execution. Fenced wrappers only replace
+      // the same current connection ID; legacy wrappers must not replace fenced sockets.
       for (const existingWs of state.getWebSockets(`ingest:${executionId}`)) {
+        let existingAttachment: IngestAttachment | null = null;
+        try {
+          existingAttachment = existingWs.deserializeAttachment() as IngestAttachment | null;
+        } catch {
+          existingAttachment = null;
+        }
+        const shouldReplace = wrapperConnectionId
+          ? existingAttachment?.wrapperGeneration === wrapperGeneration &&
+            existingAttachment?.wrapperConnectionId === wrapperConnectionId
+          : !existingAttachment?.wrapperConnectionId;
+        if (!shouldReplace) continue;
         try {
           existingWs.close(1000, 'Replaced by new connection');
         } catch {
@@ -278,6 +338,8 @@ export function createIngestHandler(
         kiloSessionState: { captured: false },
         lastHeartbeatUpdate: now,
         lastEventAtUpdate: 0,
+        wrapperGeneration,
+        wrapperConnectionId,
       };
 
       // Accept the WebSocket with hibernation support
@@ -285,11 +347,13 @@ export function createIngestHandler(
       state.acceptWebSocket(server, [`ingest:${executionId}`]);
       server.serializeAttachment(attachment);
 
-      // Cancel any pending disconnect grace period — wrapper reconnected
-      await doContext.cancelDisconnectGrace?.();
+      // Cancel any pending disconnect grace period for the validated current wrapper.
+      await doContext.cancelDisconnectGrace?.(wrapperGeneration, wrapperConnectionId);
 
       // Set initial heartbeat
-      void doContext.updateHeartbeat(executionId, now);
+      doContext.updateHeartbeat(executionId, now).catch(error => {
+        console.warn('Failed to update initial heartbeat', error);
+      });
 
       return new Response(null, { status: 101, webSocket: client });
     },
@@ -325,7 +389,14 @@ export function createIngestHandler(
         return;
       }
 
-      const { executionId } = attachment;
+      const { executionId, wrapperGeneration, wrapperConnectionId } = attachment;
+      if (wrapperGeneration !== undefined && wrapperConnectionId) {
+        const isCurrent = await doContext.isCurrentWrapperConnection?.(
+          wrapperGeneration,
+          wrapperConnectionId
+        );
+        if (!isCurrent) return;
+      }
 
       try {
         // Parse the ingest event
@@ -346,6 +417,20 @@ export function createIngestHandler(
 
         const eventType = ingestEvent.streamEventType;
         const payload = JSON.stringify(ingestEvent.data ?? {});
+        const eventTypeStr: string = eventType;
+
+        const now = Date.now();
+        if (wrapperGeneration !== undefined && wrapperConnectionId) {
+          if (eventType === 'pong') {
+            await doContext.recordWrapperPong?.(wrapperGeneration, wrapperConnectionId, now);
+          } else if (eventTypeStr !== 'wrapper_resumed') {
+            await doContext.recordMeaningfulWrapperOutput?.(
+              wrapperGeneration,
+              wrapperConnectionId,
+              now
+            );
+          }
+        }
 
         let eventId: number;
 
@@ -404,23 +489,25 @@ export function createIngestHandler(
         broadcastFn(storedEvent);
 
         // Update heartbeat (debounced to every HEARTBEAT_DEBOUNCE_MS)
-        const now = Date.now();
         if (now - attachment.lastHeartbeatUpdate >= HEARTBEAT_DEBOUNCE_MS) {
           attachment.lastHeartbeatUpdate = now;
           ws.serializeAttachment(attachment);
-          void doContext.updateHeartbeat(executionId, now);
+          doContext.updateHeartbeat(executionId, now).catch(error => {
+            console.warn('Failed to update heartbeat', error);
+          });
         }
 
         // Update lastEventAt for non-heartbeat events (leading-edge throttle).
         // Events arriving within HEARTBEAT_DEBOUNCE_MS of the last write are
-        // skipped — the stored timestamp may lag behind the true latest event
-        // by up to the throttle window. This is fine because the only consumer
-        // (checkHungExecution) uses a 5-minute timeout on a 2-minute alarm cycle.
+        // skipped, so the stored timestamp may lag behind the true latest event
+        // by up to the throttle window.
         if (eventType !== 'heartbeat') {
           if (now - attachment.lastEventAtUpdate >= HEARTBEAT_DEBOUNCE_MS) {
             attachment.lastEventAtUpdate = now;
             ws.serializeAttachment(attachment);
-            void doContext.updateLastEventAt(executionId, now);
+            doContext.updateLastEventAt(executionId, now).catch(error => {
+              console.warn('Failed to update lastEventAt', error);
+            });
           }
         }
 
@@ -448,7 +535,6 @@ export function createIngestHandler(
         // Handle autocommit events — emit cloud.status for finalizing/ready.
         // Compare via string variable because the local StreamEventType union
         // does not include wrapper-only event names like autocommit_*.
-        const eventTypeStr: string = eventType;
         if (eventTypeStr === 'autocommit_started') {
           broadcastFn({
             id: 0 as EventId,
@@ -589,18 +675,29 @@ export function createIngestHandler(
      *
      * @param ws - The WebSocket that closed
      */
-    handleIngestClose(ws: WebSocket): ExecutionId | null {
+    async handleIngestClose(ws: WebSocket): Promise<{
+      executionId: ExecutionId;
+      wrapperGeneration?: number;
+      wrapperConnectionId?: string;
+    } | null> {
       const attachment = ws.deserializeAttachment() as IngestAttachment | null;
       if (!attachment) return null;
 
-      const { executionId } = attachment;
+      const { executionId, wrapperGeneration, wrapperConnectionId } = attachment;
+      if (wrapperGeneration !== undefined && wrapperConnectionId) {
+        const isCurrent = await doContext.isCurrentWrapperConnection?.(
+          wrapperGeneration,
+          wrapperConnectionId
+        );
+        if (!isCurrent) return null;
+      }
 
       // If another ingest socket still exists for this execution (e.g. a
       // replacement connection), the wrapper isn't truly gone.
       const remaining = state.getWebSockets(`ingest:${executionId}`);
       if (remaining.length > 0) return null;
 
-      return executionId;
+      return { executionId, wrapperGeneration, wrapperConnectionId };
     },
 
     /**
@@ -612,8 +709,22 @@ export function createIngestHandler(
      * @param executionId - Execution ID to check
      * @returns True if there's an active connection for this execution
      */
-    hasActiveConnection(executionId: ExecutionId): boolean {
-      return state.getWebSockets(`ingest:${executionId}`).length > 0;
+    hasActiveConnection(
+      executionId: ExecutionId,
+      wrapperGeneration?: number,
+      wrapperConnectionId?: string
+    ): boolean {
+      const sockets = state.getWebSockets(`ingest:${executionId}`);
+      if (wrapperGeneration === undefined && wrapperConnectionId === undefined) {
+        return sockets.length > 0;
+      }
+      return sockets.some(socket => {
+        const attachment = socket.deserializeAttachment() as IngestAttachment | null;
+        return (
+          attachment?.wrapperGeneration === wrapperGeneration &&
+          attachment?.wrapperConnectionId === wrapperConnectionId
+        );
+      });
     },
   };
 }
