@@ -123,6 +123,14 @@ export async function isCurrentWrapperConnection(
   );
 }
 
+/**
+ * Conditionally update the wrapper runtime state if the current generation
+ * and connection ID match the expected values.
+ *
+ * Safety: The read-then-write pattern is safe because Durable Objects
+ * guarantee single-threaded execution per instance — no concurrent request
+ * or alarm can interleave between the get() and put().
+ */
 async function updateIfCurrent(
   storage: DurableObjectStorage,
   wrapperGeneration: number,

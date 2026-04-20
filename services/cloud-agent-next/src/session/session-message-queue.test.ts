@@ -8,6 +8,10 @@ import {
 } from './session-message-queue.js';
 import {
   createPendingSessionMessage,
+  PENDING_FLUSH_MAX_ATTEMPTS,
+  PENDING_FLUSH_RETRY_BASE_DELAY_MS,
+  PENDING_FLUSH_RETRY_MAX_DELAY_MS,
+  recordPendingFlushFailure,
   storePendingSessionMessage,
   type PendingSessionMessage,
   type SessionQueueStorage,
@@ -84,6 +88,39 @@ function createContext() {
     },
   };
 }
+
+describe('recordPendingFlushFailure backoff progression', () => {
+  it('applies exponential backoff clamped to the max delay', async () => {
+    const storage = createMemoryStorage();
+    let message = createPendingSessionMessage({
+      messageId: 'msg_018f1e2d3c4bBackoffAbCdEfG',
+      role: 'user',
+      content: 'test',
+      createdAt: 1,
+    });
+    await storePendingSessionMessage(storage, message);
+
+    const delays: (number | undefined)[] = [];
+    const now = 100_000;
+
+    for (let i = 0; i < PENDING_FLUSH_MAX_ATTEMPTS; i++) {
+      const result = await recordPendingFlushFailure(storage, message, 'test error', now);
+      delays.push(
+        result.nextFlushAttemptAt !== undefined ? result.nextFlushAttemptAt - now : undefined
+      );
+      message = result.message;
+    }
+
+    // Verify exponential backoff: 2s, 4s, 8s, 15s (capped), then exhausted (undefined)
+    expect(delays).toEqual([
+      PENDING_FLUSH_RETRY_BASE_DELAY_MS * 1, // attempt 1: 2000
+      PENDING_FLUSH_RETRY_BASE_DELAY_MS * 2, // attempt 2: 4000
+      PENDING_FLUSH_RETRY_BASE_DELAY_MS * 4, // attempt 3: 8000
+      PENDING_FLUSH_RETRY_MAX_DELAY_MS, // attempt 4: 15000 (capped)
+      undefined, // attempt 5: exhausted
+    ]);
+  });
+});
 
 describe('session-message-queue', () => {
   it('creates queued messages with persisted execution options', () => {
@@ -204,6 +241,7 @@ describe('session-message-queue', () => {
     if (first.type !== 'failure') return;
     expect(first.message.flushAttempts).toBe(1);
     expect(first.message.executionKind).toBe('followup');
+    expect(first.remainingCount).toBe(1);
 
     const second = await flushNextPendingSessionMessage({
       storage,
@@ -214,7 +252,7 @@ describe('session-message-queue', () => {
       deliver,
     });
 
-    expect(second).toEqual({ type: 'delivered' });
+    expect(second).toEqual({ type: 'delivered', remainingCount: 0 });
     expect(deliver).toHaveBeenCalledTimes(2);
     const secondBuildPlanCall = buildPlan.mock.calls[1];
     expect(secondBuildPlanCall).toBeDefined();
@@ -292,7 +330,7 @@ describe('session-message-queue', () => {
       },
     });
 
-    expect(result).toEqual({ type: 'delivered' });
+    expect(result).toEqual({ type: 'delivered', remainingCount: 0 });
     expect(buildPlan).toHaveBeenCalledWith(
       expect.objectContaining({ executionKind: 'initiatePrepared' })
     );

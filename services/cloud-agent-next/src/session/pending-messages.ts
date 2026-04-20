@@ -5,7 +5,7 @@ import { MESSAGE_ID_FORMAT_DESCRIPTION, MESSAGE_ID_PATTERN } from './message-id.
 
 export const PENDING_SESSION_MESSAGE_LIMIT = 10;
 export const PENDING_FLUSH_RETRY_MAX_DELAY_MS = 15_000;
-export const PENDING_FLUSH_RETRY_BASE_DELAY_MS = PENDING_FLUSH_RETRY_MAX_DELAY_MS;
+export const PENDING_FLUSH_RETRY_BASE_DELAY_MS = 2_000;
 export const PENDING_FLUSH_MAX_ATTEMPTS = 5;
 
 const PENDING_MESSAGE_PREFIX = 'pending_message:';
@@ -226,10 +226,11 @@ export async function recordPendingFlushFailure(
     lastFlushError: error,
   };
 
-  if (exhausted) {
-    await deletePendingSessionMessageByMessageId(storage, message.messageId);
-  } else {
-    await deletePendingSessionMessageByMessageId(storage, message.messageId);
+  // Always delete by messageId first — the original entry may be stored under a
+  // non-canonical key (e.g. during migration), so a simple put-overwrite would
+  // leave the old key behind and create a duplicate.
+  await deletePendingSessionMessageByMessageId(storage, message.messageId);
+  if (!exhausted) {
     await storePendingSessionMessage(storage, updated);
   }
 

@@ -150,6 +150,50 @@ type DisconnectGraceState = {
   wrapperConnectionId?: string;
 };
 
+type DisconnectGraceFence = {
+  wrapperGeneration?: number;
+  wrapperConnectionId?: string;
+};
+
+/**
+ * Check whether a fence matches the disconnect grace state.
+ *
+ * Rules:
+ * - If the grace state carries wrapper identity (generation or connectionId),
+ *   the fence MUST supply both fields to match — unfenced reconnects cannot
+ *   cancel fenced grace periods.
+ * - Each fence field, when present, must equal the corresponding grace field.
+ */
+function matchesDisconnectGraceFence(
+  graceState: DisconnectGraceState,
+  fence?: DisconnectGraceFence
+): boolean {
+  const graceHasIdentity =
+    graceState.wrapperGeneration !== undefined || graceState.wrapperConnectionId !== undefined;
+
+  if (graceHasIdentity) {
+    if (fence?.wrapperGeneration === undefined || fence.wrapperConnectionId === undefined) {
+      return false;
+    }
+  }
+
+  if (
+    fence?.wrapperGeneration !== undefined &&
+    graceState.wrapperGeneration !== fence.wrapperGeneration
+  ) {
+    return false;
+  }
+
+  if (
+    fence?.wrapperConnectionId !== undefined &&
+    graceState.wrapperConnectionId !== fence.wrapperConnectionId
+  ) {
+    return false;
+  }
+
+  return true;
+}
+
 export class CloudAgentSession extends DurableObject {
   private executionQueries: ExecutionQueries;
   private eventQueries: EventQueries;
@@ -1304,6 +1348,7 @@ export class CloudAgentSession extends DurableObject {
       .info('Alarm fired');
 
     let pendingFlushRetryAt: number | undefined;
+    let remainingPendingCount: number | undefined;
 
     try {
       // Run pending async preparation if scheduled.
@@ -1406,7 +1451,9 @@ export class CloudAgentSession extends DurableObject {
         .debug('Starting cleanupIdleKiloServer');
       await this.cleanupIdleKiloServer(now);
 
-      pendingFlushRetryAt = await this.flushOnePendingSessionMessage();
+      const flushOneResult = await this.flushOnePendingSessionMessage();
+      pendingFlushRetryAt = flushOneResult.retryAt;
+      remainingPendingCount = flushOneResult.remainingPendingCount;
 
       logger
         .withFields({ sessionId: this.sessionId, elapsedMs: Date.now() - now })
@@ -1428,7 +1475,7 @@ export class CloudAgentSession extends DurableObject {
     // Wrapped in try/catch so a failure here never prevents rescheduling the alarm.
     let nextAlarmAt = Date.now() + REAPER_IDLE_INTERVAL_MS;
     try {
-      const remainingPendingCount = await countPendingSessionMessages(this.ctx.storage);
+      const pendingCount = remainingPendingCount ?? 0;
       const currentTime = Date.now();
       const deadlines = await this.getNextAlarmDeadlines();
       if (pendingFlushRetryAt !== undefined) {
@@ -1444,7 +1491,7 @@ export class CloudAgentSession extends DurableObject {
 
       if (
         pendingFlushRetryAt === undefined &&
-        remainingPendingCount > 0 &&
+        pendingCount > 0 &&
         currentTime + PENDING_FLUSH_DEBOUNCE_MS < nextAlarmAt
       ) {
         nextAlarmAt = currentTime + PENDING_FLUSH_DEBOUNCE_MS;
@@ -1818,32 +1865,10 @@ export class CloudAgentSession extends DurableObject {
    * Called when the wrapper reconnects or when another codepath fails
    * the execution.
    */
-  private async cancelDisconnectGrace(fence?: {
-    wrapperGeneration?: number;
-    wrapperConnectionId?: string;
-  }): Promise<void> {
+  private async cancelDisconnectGrace(fence?: DisconnectGraceFence): Promise<void> {
     const graceState = await this.ctx.storage.get<DisconnectGraceState>(DISCONNECT_GRACE_KEY);
     if (!graceState) return;
-    if (
-      graceState.wrapperGeneration !== undefined ||
-      graceState.wrapperConnectionId !== undefined
-    ) {
-      if (fence?.wrapperGeneration === undefined || fence.wrapperConnectionId === undefined) {
-        return;
-      }
-    }
-    if (
-      fence?.wrapperGeneration !== undefined &&
-      graceState.wrapperGeneration !== fence.wrapperGeneration
-    ) {
-      return;
-    }
-    if (
-      fence?.wrapperConnectionId !== undefined &&
-      graceState.wrapperConnectionId !== fence.wrapperConnectionId
-    ) {
-      return;
-    }
+    if (!matchesDisconnectGraceFence(graceState, fence)) return;
     await this.ctx.storage.delete(DISCONNECT_GRACE_KEY);
   }
 
@@ -2962,7 +2987,10 @@ export class CloudAgentSession extends DurableObject {
     }
   }
 
-  private async flushOnePendingSessionMessage(): Promise<number | undefined> {
+  private async flushOnePendingSessionMessage(): Promise<{
+    retryAt?: number;
+    remainingPendingCount: number;
+  }> {
     const now = Date.now();
     const flushResult = await flushNextPendingSessionMessage({
       storage: this.ctx.storage,
@@ -3102,15 +3130,22 @@ export class CloudAgentSession extends DurableObject {
 
     if (flushResult.type === 'skipped') {
       if (flushResult.nextFlushAttemptAt !== undefined) {
-        return flushResult.nextFlushAttemptAt;
+        return {
+          retryAt: flushResult.nextFlushAttemptAt,
+          remainingPendingCount: flushResult.remainingCount,
+        };
       }
 
       const currentRuntimeExecution = await this.getCurrentRuntimeExecution();
-      return currentRuntimeExecution ? now + PENDING_FLUSH_DEBOUNCE_MS : undefined;
+      const hasPendingWork = flushResult.remainingCount > 0 && currentRuntimeExecution;
+      return {
+        retryAt: hasPendingWork ? now + PENDING_FLUSH_DEBOUNCE_MS : undefined,
+        remainingPendingCount: flushResult.remainingCount,
+      };
     }
 
     if (flushResult.type === 'delivered') {
-      return undefined;
+      return { remainingPendingCount: flushResult.remainingCount };
     }
 
     const metadata = await this.getMetadata();
@@ -3130,11 +3165,19 @@ export class CloudAgentSession extends DurableObject {
       flushResult.attempts,
       flushResult.exhausted
     );
-    return flushResult.nextFlushAttemptAt;
+    return {
+      retryAt: flushResult.nextFlushAttemptAt,
+      remainingPendingCount: flushResult.remainingCount,
+    };
   }
 
   private async emitPendingMessageInterrupted(message: PendingSessionMessage): Promise<void> {
     const sessionId = await this.requireSessionId();
+    if (!message.executionId) {
+      logger
+        .withFields({ sessionId: this.sessionId, messageId: message.messageId })
+        .warn('Pending message missing executionId; generating fallback');
+    }
     const executionId = (message.executionId ?? createExecutionId()) as ExecutionId;
     this.insertAndBroadcastEvent({
       executionId,
@@ -3159,6 +3202,11 @@ export class CloudAgentSession extends DurableObject {
     if (!exhausted) return;
 
     const sessionId = await this.requireSessionId();
+    if (!message.executionId) {
+      logger
+        .withFields({ sessionId: this.sessionId, messageId: message.messageId })
+        .warn('Pending message missing executionId; generating fallback');
+    }
     const executionId = (message.executionId ?? createExecutionId()) as ExecutionId;
     this.insertAndBroadcastEvent({
       executionId,

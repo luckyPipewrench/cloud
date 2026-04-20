@@ -14,6 +14,15 @@ export function isCanonicalMessageId(value: string): boolean {
   return MESSAGE_ID_PATTERN.test(value);
 }
 
+/**
+ * Produce a 12-character lowercase hex prefix encoding the Unix-epoch
+ * millisecond timestamp in ULID-compatible format.
+ *
+ * Multiplying by 0x1000 (left-shift 12 bits) aligns the millisecond
+ * timestamp into the upper 48 bits of a 128-bit value so the resulting
+ * hex string sorts identically to standard ULID ordering.  The 6 bytes
+ * are extracted big-endian and hex-encoded.
+ */
 function createTimePrefix(now: number): string {
   const timeBytes = new Uint8Array(6);
   const timestamp = BigInt(now) * BigInt(0x1000);

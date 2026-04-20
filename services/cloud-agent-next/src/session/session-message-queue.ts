@@ -87,15 +87,18 @@ export type PendingFlushFailure = {
   attempts: number;
   exhausted: boolean;
   nextFlushAttemptAt?: number;
+  remainingCount: number;
 };
 
 export type PendingFlushSkipped = {
   type: 'skipped';
   nextFlushAttemptAt?: number;
+  remainingCount: number;
 };
 
 export type PendingFlushDelivered = {
   type: 'delivered';
+  remainingCount: number;
 };
 
 export type PendingFlushResult = PendingFlushFailure | PendingFlushSkipped | PendingFlushDelivered;
@@ -144,18 +147,24 @@ export async function flushNextPendingSessionMessage(params: {
     executionKind: PendingSessionExecutionKind
   ) => void;
 }): Promise<PendingFlushResult> {
-  const [message] = await listPendingSessionMessages(params.storage);
+  const messages = await listPendingSessionMessages(params.storage);
+  const [message] = messages;
+  const totalCount = messages.length;
 
   if (!message) {
-    return { type: 'skipped' };
+    return { type: 'skipped', remainingCount: 0 };
   }
 
   if (shouldSkipPendingFlush(message, params.now)) {
-    return { type: 'skipped', nextFlushAttemptAt: message.nextFlushAttemptAt };
+    return {
+      type: 'skipped',
+      nextFlushAttemptAt: message.nextFlushAttemptAt,
+      remainingCount: totalCount,
+    };
   }
 
   if (await params.hasCurrentRuntimeExecution()) {
-    return { type: 'skipped' };
+    return { type: 'skipped', remainingCount: totalCount };
   }
 
   const context = await params.getMetadataContext();
@@ -166,7 +175,11 @@ export async function flushNextPendingSessionMessage(params: {
       'Session metadata is not available',
       params.now
     );
-    return { type: 'failure', ...failure };
+    return {
+      type: 'failure',
+      ...failure,
+      remainingCount: failure.exhausted ? totalCount - 1 : totalCount,
+    };
   }
 
   const executionKind = resolvePendingExecutionKind(message, context);
@@ -181,7 +194,11 @@ export async function flushNextPendingSessionMessage(params: {
       'Session has not been initiated',
       params.now
     );
-    return { type: 'failure', ...failure };
+    return {
+      type: 'failure',
+      ...failure,
+      remainingCount: failure.exhausted ? totalCount - 1 : totalCount,
+    };
   }
 
   const options = resolvePendingSessionMessageExecutionOptions(message, {
@@ -199,7 +216,11 @@ export async function flushNextPendingSessionMessage(params: {
       'Session is missing a valid model',
       params.now
     );
-    return { type: 'failure', ...failure };
+    return {
+      type: 'failure',
+      ...failure,
+      remainingCount: failure.exhausted ? totalCount - 1 : totalCount,
+    };
   }
 
   const executionId = message.executionId as ExecutionId;
@@ -211,7 +232,7 @@ export async function flushNextPendingSessionMessage(params: {
       throw new Error(startResult.error);
     }
     await deletePendingSessionMessageByMessageId(params.storage, message.messageId);
-    return { type: 'delivered' };
+    return { type: 'delivered', remainingCount: totalCount - 1 };
   } catch (error) {
     const failure = await recordPendingFlushFailure(
       params.storage,
@@ -219,7 +240,11 @@ export async function flushNextPendingSessionMessage(params: {
       error instanceof Error ? error.message : String(error),
       params.now
     );
-    return { type: 'failure', ...failure };
+    return {
+      type: 'failure',
+      ...failure,
+      remainingCount: failure.exhausted ? totalCount - 1 : totalCount,
+    };
   }
 }
 
