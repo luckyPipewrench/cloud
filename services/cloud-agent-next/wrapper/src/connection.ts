@@ -72,6 +72,34 @@ type WebSocketCtor = new (
   options?: { headers?: Record<string, string> } | string | string[]
 ) => WebSocket;
 
+export type IngestConnectionFailureReason = 'websocket_error' | 'closed_before_open' | 'timeout';
+
+export type IngestConnectionFailureDetails = {
+  reason: IngestConnectionFailureReason;
+  wsUrl: string;
+  closeCode?: number;
+  closeReason?: string;
+};
+
+const INGEST_CONNECTION_FAILURE_HINTS: Record<IngestConnectionFailureReason, string> = {
+  websocket_error:
+    'WebSocket error before open; Bun does not expose the HTTP status. If the Worker logs no /ingest request, check WORKER_URL and sandbox-to-host networking; if it logs a 4xx, inspect the DO rejection reason.',
+  closed_before_open:
+    'WebSocket closed before open. If the Worker logs a 4xx for /ingest, inspect the DO rejection reason; if it logs no request, check WORKER_URL and sandbox-to-host networking.',
+  timeout:
+    'Timed out before open; check WORKER_URL and whether the sandbox can reach the local cloud-agent Worker.',
+};
+
+export function buildIngestConnectionFailureMessage(
+  details: IngestConnectionFailureDetails
+): string {
+  const closeDetails =
+    details.closeCode !== undefined
+      ? ` closeCode=${details.closeCode} closeReason=${details.closeReason || '(none)'}`
+      : '';
+  return `Failed to connect to ingest: ${details.wsUrl} (${INGEST_CONNECTION_FAILURE_HINTS[details.reason]}${closeDetails})`;
+}
+
 /** Maximum number of reconnection attempts before giving up.
  *  3 attempts ≈ 7s total (1+2+4), fitting within the DO's 10s grace period. */
 const MAX_RECONNECT_ATTEMPTS = 3;
@@ -267,6 +295,30 @@ export function createConnectionManager(
     logToFile(`ingest WS connecting to: ${wsUrl}`);
 
     return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      let initialConnectTimer: ReturnType<typeof setTimeout> | undefined;
+
+      const clearInitialConnectTimer = () => {
+        if (initialConnectTimer !== undefined) {
+          clearTimeout(initialConnectTimer);
+          initialConnectTimer = undefined;
+        }
+      };
+
+      const rejectInitialConnect = (details: IngestConnectionFailureDetails) => {
+        if (settled) return;
+        settled = true;
+        clearInitialConnectTimer();
+        reject(new Error(buildIngestConnectionFailureMessage(details)));
+      };
+
+      const resolveInitialConnect = () => {
+        if (settled) return;
+        settled = true;
+        clearInitialConnectTimer();
+        resolve();
+      };
+
       // Bun's WebSocket supports headers parameter
       const WebSocketWithHeaders = WebSocket as unknown as WebSocketCtor;
 
@@ -278,12 +330,24 @@ export function createConnectionManager(
       });
 
       ws.onopen = () => {
+        if (settled) {
+          logToFile(`ingest WS opened after initial connection was already settled: ${wsUrl}`);
+          try {
+            ws.close();
+          } catch {
+            /* ignore */
+          }
+          return;
+        }
+
         logToFile(`ingest WS connected to: ${wsUrl}`);
         // Guard against stale reconnect: if close() was called while we were
         // connecting, generation will have advanced and we must not adopt
         // this socket or flush buffered events through it.
         if (expectedGeneration !== undefined && expectedGeneration !== generation) {
           logToFile('stale reconnect detected in onopen — discarding socket');
+          settled = true;
+          clearInitialConnectTimer();
           try {
             ws.close();
           } catch {
@@ -294,13 +358,22 @@ export function createConnectionManager(
         }
         ingestWs = ws;
         flushBuffer();
-        resolve();
+        resolveInitialConnect();
       };
 
       ws.onclose = (event: CloseEvent) => {
         logToFile(
           `ingest WS closed: code=${event.code} reason=${event.reason || '(none)'} url=${wsUrl}`
         );
+        if (!settled) {
+          rejectInitialConnect({
+            reason: 'closed_before_open',
+            wsUrl,
+            closeCode: event.code,
+            closeReason: event.reason,
+          });
+          return;
+        }
         if (ingestWs !== ws) return; // Stale socket — ignore
 
         ingestWs = null;
@@ -318,8 +391,8 @@ export function createConnectionManager(
 
       ws.onerror = () => {
         logToFile(`ingest WS error connecting to: ${wsUrl}`);
-        if (!ingestWs) {
-          reject(new Error(`Failed to connect to ingest: ${wsUrl}`));
+        if (!settled) {
+          rejectInitialConnect({ reason: 'websocket_error', wsUrl });
         }
       };
 
@@ -333,10 +406,15 @@ export function createConnectionManager(
       };
 
       // Timeout for initial connection
-      setTimeout(() => {
-        if (!ingestWs) {
-          ws.close();
-          reject(new Error('Ingest connection timeout'));
+      initialConnectTimer = setTimeout(() => {
+        if (!settled) {
+          logToFile(`ingest WS connection timed out: ${wsUrl}`);
+          rejectInitialConnect({ reason: 'timeout', wsUrl });
+          try {
+            ws.close();
+          } catch {
+            /* ignore */
+          }
         }
       }, 10_000);
     });
