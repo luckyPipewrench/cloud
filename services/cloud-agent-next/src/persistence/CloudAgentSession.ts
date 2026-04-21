@@ -1526,7 +1526,7 @@ export class CloudAgentSession extends DurableObject {
     const now = Date.now();
     const clampedDeadline = deadline <= now ? now + 1_000 : deadline;
     const existingAlarm = await this.ctx.storage.getAlarm();
-    if (existingAlarm === null || clampedDeadline < existingAlarm) {
+    if (existingAlarm === null || existingAlarm <= now || clampedDeadline < existingAlarm) {
       await this.ctx.storage.setAlarm(clampedDeadline);
     }
   }

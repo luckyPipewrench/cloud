@@ -198,6 +198,27 @@ describe('pending session messages', () => {
     expect(count).toBe(PENDING_SESSION_MESSAGE_LIMIT);
   });
 
+  it('refreshes stale past alarms when scheduling pending work', async () => {
+    const userId = 'user_pending_stale_alarm';
+    const sessionId = 'agent_pending_stale_alarm';
+    const stub = env.CLOUD_AGENT_SESSION.get(
+      env.CLOUD_AGENT_SESSION.idFromName(`${userId}:${sessionId}`)
+    );
+
+    const result = await runInDurableObject(stub, async instance => {
+      const now = Date.now();
+      await instance.ctx.storage.setAlarm(now - 120_000);
+      const staleAlarm = await instance.ctx.storage.getAlarm();
+      await instance['schedulePendingMessageFlush']();
+      const refreshedAlarm = await instance.ctx.storage.getAlarm();
+
+      return { now, staleAlarm, refreshedAlarm };
+    });
+
+    expect(result.staleAlarm).toBeDefined();
+    expect(result.refreshedAlarm).toBeGreaterThan(result.staleAlarm ?? result.now);
+  });
+
   it('flushes one FIFO message on alarm and deletes after orchestrator accepts', async () => {
     const userId = 'user_pending_flush';
     const sessionId = 'agent_pending_flush';
