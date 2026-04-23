@@ -73,7 +73,6 @@ import { isExecutionError } from '../execution/errors.js';
 import type { Env as WorkerEnv, SandboxId } from '../types.js';
 import { generateSandboxId, getSandboxNamespace } from '../sandbox-id.js';
 
-import { GitHubTokenService } from '../services/github-token-service.js';
 import { validateStreamTicket } from '../auth.js';
 import { getSandbox } from '@cloudflare/sandbox';
 import { stopWrapper } from '../kilo/wrapper-manager.js';
@@ -865,6 +864,7 @@ export class CloudAgentSession extends DurableObject {
     gitUrl?: string;
     gitToken?: string;
     platform?: 'github' | 'gitlab';
+    gitlabTokenManaged?: boolean;
     envVars?: Record<string, string>;
     encryptedSecrets?: EncryptedSecrets;
     setupCommands?: string[];
@@ -1083,8 +1083,9 @@ export class CloudAgentSession extends DurableObject {
         githubInstallationId: result.resolvedInstallationId,
         githubAppType: result.resolvedGithubAppType,
         gitUrl: input.gitUrl,
-        gitToken: input.gitToken,
+        gitToken: result.resolvedGitToken,
         platform: input.platform,
+        gitlabTokenManaged: result.gitlabTokenManaged,
         envVars: input.envVars,
         encryptedSecrets: input.encryptedSecrets,
         setupCommands: input.setupCommands,
@@ -2271,15 +2272,30 @@ export class CloudAgentSession extends DurableObject {
     };
   }
 
-  private getGitHubTokenService(): GitHubTokenService {
+  /**
+   * Refresh a managed GitLab token via GIT_TOKEN_SERVICE. Logs and returns
+   * the current value if the refresh fails so callers can keep running with
+   * the last-known token (best effort).
+   */
+  private async refreshManagedGitLabToken(
+    metadata: CloudAgentSessionState,
+    current: string | undefined
+  ): Promise<string | undefined> {
+    if (!metadata.gitlabTokenManaged || metadata.platform !== 'gitlab') {
+      return current;
+    }
     const env = this.env as unknown as WorkerEnv;
-    return new GitHubTokenService({
-      GITHUB_TOKEN_CACHE: env.GITHUB_TOKEN_CACHE,
-      GITHUB_APP_ID: env.GITHUB_APP_ID,
-      GITHUB_APP_PRIVATE_KEY: env.GITHUB_APP_PRIVATE_KEY,
-      GITHUB_LITE_APP_ID: env.GITHUB_LITE_APP_ID,
-      GITHUB_LITE_APP_PRIVATE_KEY: env.GITHUB_LITE_APP_PRIVATE_KEY,
+    const result = await env.GIT_TOKEN_SERVICE.getGitLabToken({
+      userId: metadata.userId,
+      orgId: metadata.orgId,
     });
+    if (result.success) {
+      return result.token;
+    }
+    logger
+      .withFields({ reason: result.reason, sessionId: metadata.sessionId })
+      .warn('Managed GitLab token refresh failed; using last-known value');
+    return current;
   }
 
   /**
@@ -2451,7 +2467,7 @@ export class CloudAgentSession extends DurableObject {
         let githubToken = metadata.githubToken;
         if (metadata.githubInstallationId) {
           const appType = metadata.githubAppType || 'standard';
-          githubToken = await this.getGitHubTokenService().getToken(
+          githubToken = await (this.env as unknown as WorkerEnv).GIT_TOKEN_SERVICE.getToken(
             metadata.githubInstallationId,
             appType
           );
@@ -2462,6 +2478,8 @@ export class CloudAgentSession extends DurableObject {
             'GitHub authentication required for this repository'
           );
         }
+
+        const gitToken = await this.refreshManagedGitLabToken(metadata, metadata.gitToken);
 
         const sandboxId =
           metadata.sandboxId ??
@@ -2478,7 +2496,7 @@ export class CloudAgentSession extends DurableObject {
           githubRepo: metadata.githubRepo,
           githubToken,
           gitUrl: metadata.gitUrl,
-          gitToken: metadata.gitToken,
+          gitToken,
           envVars: metadata.envVars,
           encryptedSecrets: metadata.encryptedSecrets,
           setupCommands: metadata.setupCommands,
@@ -2545,7 +2563,7 @@ export class CloudAgentSession extends DurableObject {
       let githubToken = request.tokenOverrides?.githubToken ?? metadata.githubToken;
       if (!request.tokenOverrides?.githubToken && metadata.githubInstallationId) {
         const appType = metadata.githubAppType || 'standard';
-        githubToken = await this.getGitHubTokenService().getToken(
+        githubToken = await (this.env as unknown as WorkerEnv).GIT_TOKEN_SERVICE.getToken(
           metadata.githubInstallationId,
           appType
         );
@@ -2556,6 +2574,12 @@ export class CloudAgentSession extends DurableObject {
           'GitHub authentication required for this repository'
         );
       }
+
+      // Refresh GitLab token if auto-managed (override wins when provided)
+      const overrideGitToken = request.tokenOverrides?.gitToken;
+      const gitToken = overrideGitToken
+        ? overrideGitToken
+        : await this.refreshManagedGitLabToken(metadata, metadata.gitToken);
 
       const sandboxId =
         metadata.sandboxId ??
@@ -2570,7 +2594,7 @@ export class CloudAgentSession extends DurableObject {
         kilocodeToken: metadata.kilocodeToken ?? '',
         kilocodeModel: model,
         githubToken,
-        gitToken: request.tokenOverrides?.gitToken,
+        gitToken,
       };
 
       const plan = this.buildExecutionPlan({
