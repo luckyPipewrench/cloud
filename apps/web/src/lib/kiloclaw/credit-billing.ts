@@ -21,6 +21,7 @@ import {
   clearTrialInactivityStopAfterTrialTransition,
 } from '@/lib/kiloclaw/instance-lifecycle';
 import { buildAffiliateEventDedupeKey, enqueueAffiliateEventForUser } from '@/lib/affiliate-events';
+import { processPersonalKiloClawPaidConversion } from '@/lib/kiloclaw-referrals';
 import {
   computeUsageTriggeredMonthlyBonusDecision,
   maybeIssueKiloPassBonusFromUsageThreshold,
@@ -300,6 +301,22 @@ async function enqueueCreditEnrollmentAffiliateEvents(params: {
       eventDate: params.eventDate,
       orderId: IMPACT_ORDER_ID_MACRO,
     });
+  }
+
+  const conversionDisposition = await processPersonalKiloClawPaidConversion({
+    userId: params.userId,
+    sourcePaymentId: params.saleOrderId,
+    orderId: params.saleOrderId,
+    amount: params.saleAmountMicrodollars / 1_000_000,
+    currencyCode: 'usd',
+    itemCategory: getKiloClawAffiliateItemCategory(params.plan),
+    itemName: getKiloClawAffiliateItemName(params.plan),
+    itemSku: params.saleItemSku,
+    convertedAt: params.eventDate,
+  });
+
+  if (!conversionDisposition.shouldEnqueueAffiliateSale) {
+    return;
   }
 
   await enqueueAffiliateEventForUser({
@@ -869,17 +886,6 @@ export async function enrollWithCredits(params: {
         after: mutatedSubscription,
       });
     }
-
-    await enqueueCreditEnrollmentAffiliateEvents({
-      userId,
-      plan,
-      saleEntityId: saleDedupeKeyEntityId,
-      saleOrderId: deductionCategory,
-      saleAmountMicrodollars: costMicrodollars,
-      eventDate: now,
-      saleItemSku,
-      trialEndEntityId,
-    });
   });
 
   if (deductionWasDuplicate) {
@@ -905,6 +911,17 @@ export async function enrollWithCredits(params: {
 
     throw new Error('Enrollment already processed for this billing period.');
   }
+
+  await enqueueCreditEnrollmentAffiliateEvents({
+    userId,
+    plan,
+    saleEntityId: saleDedupeKeyEntityId,
+    saleOrderId: deductionCategory,
+    saleAmountMicrodollars: costMicrodollars,
+    eventDate: now,
+    saleItemSku,
+    trialEndEntityId,
+  });
 
   // Step 4: Post-transaction bonus evaluation (spec rule 6)
   try {
